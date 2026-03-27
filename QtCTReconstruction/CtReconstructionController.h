@@ -1,9 +1,12 @@
 #pragma once
 
+#include <QFutureWatcher>
 #include <QImage>
-#include <QObject>
 #include <QMutex>
+#include <QObject>
+#include <QPointer>
 
+#include <functional>
 #include <vector>
 
 #include "CTTypes.h"
@@ -53,12 +56,33 @@ signals:
 private:
     enum class ImageKind { Original, Sinogram, Reconstruction, Difference };
 
+public:
+    struct ReconstructionResult {
+        bool success = false;
+        bool hasVolume = false;
+        bool ready = false;
+        int maxZ = 0;
+        int currentZ = 0;
+        double genTimeSec = 0.0;
+        double sinogramTimeSec = 0.0;
+        double reconTimeSec = 0.0;
+        std::vector<QImage> originalImages;
+        std::vector<QImage> sinogramImages;
+        std::vector<QImage> reconstructionImages;
+        std::vector<QImage> differenceImages;
+    };
+
+private:
     QImage getImage(ImageKind kind, int z) const;
 
     static QImage sliceToImage(const ct::Slice& slice, bool difference_map);
     static QImage sinogramToImage(const ct::Sinogram& sinogram);
 
-    void computeAll();
+    static ReconstructionResult generateVolumeTask();
+    static ReconstructionResult reconstructionTask();
+    void applyResult(const ReconstructionResult& result);
+    void setRunning(bool running);
+    void startAsyncTask(QFutureWatcher<ReconstructionResult>* watcher, const std::function<ReconstructionResult()>& task);
 
 private:
     mutable QMutex m_mutex;
@@ -77,5 +101,7 @@ private:
     std::vector<QImage> m_sinogramImages;
     std::vector<QImage> m_reconstructionImages;
     std::vector<QImage> m_differenceImages;
+
+    QPointer<QFutureWatcher<ReconstructionResult>> m_activeWatcher;
 
 };
