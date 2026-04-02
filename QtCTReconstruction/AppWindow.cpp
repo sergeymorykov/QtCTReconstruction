@@ -268,18 +268,15 @@ void AppWindow::recreateBitmaps(const ct::Slice& original,
 }
 
 Gdiplus::Bitmap* AppWindow::sliceToBitmap(const ct::Slice& slice, const bool difference_map) {
-    if (slice.empty() || slice[0].empty()) {
-        return nullptr;
-    }
-
-    const int width = static_cast<int>(slice[0].size());
-    const int height = static_cast<int>(slice.size());
+    const int width = static_cast<int>(slice.width);
+    const int height = static_cast<int>(slice.height);
     auto* bmp = new Gdiplus::Bitmap(width, height, PixelFormat32bppARGB);
 
-    float min_v = slice[0][0];
-    float max_v = slice[0][0];
+    float min_v = slice.empty() ? 0.0f : slice[0][0];
+    float max_v = min_v;
     for (const auto& row : slice) {
-        for (const float v : row) {
+        for (size_t x = 0; x < slice.width; ++x) {
+            const float v = row[x];
             min_v = std::min(min_v, v);
             max_v = std::max(max_v, v);
         }
@@ -308,18 +305,19 @@ Gdiplus::Bitmap* AppWindow::sliceToBitmap(const ct::Slice& slice, const bool dif
 }
 
 Gdiplus::Bitmap* AppWindow::sinogramToBitmap(const ct::Sinogram& sinogram) {
-    if (sinogram.data.empty() || sinogram.data[0].empty()) {
+    if (sinogram.data.empty()) {
         return nullptr;
     }
 
-    const int width = static_cast<int>(sinogram.data[0].size());
-    const int height = static_cast<int>(sinogram.data.size());
+    const int width = static_cast<int>(sinogram.data.width);
+    const int height = static_cast<int>(sinogram.data.height);
     auto* bmp = new Gdiplus::Bitmap(width, height, PixelFormat32bppARGB);
 
     float min_v = sinogram.data[0][0];
     float max_v = sinogram.data[0][0];
     for (const auto& row : sinogram.data) {
-        for (const float v : row) {
+        for (size_t x = 0; x < sinogram.data.width; ++x) {
+            const float v = row[x];
             min_v = std::min(min_v, v);
             max_v = std::max(max_v, v);
         }

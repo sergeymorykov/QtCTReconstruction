@@ -4,6 +4,7 @@ import QtQuick.Layouts 1.3
 import QtQuick.Window 2.2
 
 Window {
+    id: root
     visible: true
     width: 1400
     height: 950
@@ -11,6 +12,16 @@ Window {
     color: "#1e1e1e"
 
     property string imagePrefix: controller.ready ? "image://ct/" : ""
+    property real updateTicker: 0
+
+    Connections {
+        target: controller
+        function onSliceUpdated(index) {
+            if (index === controller.currentZ) {
+                root.updateTicker = Math.random();
+            }
+        }
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -58,6 +69,73 @@ Window {
                 }
                 font.pixelSize: 14
                 color: controller.ready ? "#4caf50" : (controller.running ? "#ff9800" : (controller.hasVolume ? "#2196f3" : "#9e9e9e"))
+            }
+        }
+
+        // Configuration Row
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 40
+            spacing: 15
+
+            Label { text: "Backend:"; color: "white" }
+            ComboBox {
+                model: ["OpenMP (CPU)", "CUDA (GPU)"]
+                currentIndex: controller.backendType
+                onCurrentIndexChanged: {
+                    console.log("Selected backend:", currentIndex);
+                    controller.backendType = currentIndex;
+                }
+                implicitWidth: 150
+            }
+
+            Label { text: "Filter:"; color: "white" }
+            ComboBox {
+                model: ["Ramp", "Shepp-Logan", "Hamming"]
+                currentIndex: controller.filterType
+                onCurrentIndexChanged: controller.filterType = currentIndex
+                implicitWidth: 150
+            }
+
+            CheckBox {
+                text: "Buffered (Debug)"
+                checked: controller.asBuffer
+                onCheckedChanged: controller.asBuffer = checked
+                // palette.buttonText работает во всех стилях, включая Fusion,
+                // в отличие от contentItem: Text, который не поддерживается нативным Windows-стилем
+                palette.buttonText: "white"
+            }
+
+            Item { Layout.fillWidth: true }
+
+            Button {
+                text: "Load Point Cloud"
+                onClicked: controller.loadPointCloud()
+                implicitHeight: 30
+            }
+
+            Button {
+                text: "Export PNG"
+                onClicked: controller.savePng(-1)
+                implicitHeight: 30
+            }
+
+            Button {
+                text: "3D Cloud Viewer"
+                visible: controller.isDebugBuild
+                enabled: controller.hasVolume
+                onClicked: {
+                    var component = Qt.createComponent("PointCloudWindow.qml");
+                    if (component.status === Component.Ready) {
+                        // null-родитель обязателен для отдельного Window;
+                        // с root-родителем Scene3D не попадает в graphics scene
+                        var pointCloudWindow = component.createObject(null, {"ctController": controller});
+                        pointCloudWindow.show();
+                    } else if (component.status === Component.Error) {
+                        console.error("Error loading PointCloudWindow:", component.errorString());
+                    }
+                }
+                implicitHeight: 30
             }
         }
 
@@ -133,7 +211,7 @@ Window {
                     Layout.fillHeight: true
                     fillMode: Image.PreserveAspectFit
                     smooth: true
-                    source: controller.ready ? (imagePrefix + "original/" + controller.currentZ) : ""
+                    source: controller.ready ? (imagePrefix + "original/" + controller.currentZ + "?t=" + root.updateTicker) : ""
                     cache: false
 
                     Rectangle {
@@ -165,7 +243,7 @@ Window {
                     Layout.fillHeight: true
                     fillMode: Image.PreserveAspectFit
                     smooth: true
-                    source: controller.ready ? (imagePrefix + "sinogram/" + controller.currentZ) : ""
+                    source: controller.ready ? (imagePrefix + "sinogram/" + controller.currentZ + "?t=" + root.updateTicker) : ""
                     cache: false
 
                     Rectangle {
@@ -197,7 +275,7 @@ Window {
                     Layout.fillHeight: true
                     fillMode: Image.PreserveAspectFit
                     smooth: true
-                    source: controller.ready ? (imagePrefix + "reconstruction/" + controller.currentZ) : ""
+                    source: controller.ready ? (imagePrefix + "reconstruction/" + controller.currentZ + "?t=" + root.updateTicker) : ""
                     cache: false
 
                     Rectangle {
@@ -229,7 +307,7 @@ Window {
                     Layout.fillHeight: true
                     fillMode: Image.PreserveAspectFit
                     smooth: true
-                    source: controller.ready ? (imagePrefix + "difference/" + controller.currentZ) : ""
+                    source: controller.ready ? (imagePrefix + "difference/" + controller.currentZ + "?t=" + root.updateTicker) : ""
                     cache: false
 
                     Rectangle {
@@ -246,7 +324,7 @@ Window {
         // Slider row
         RowLayout {
             Layout.fillWidth: true
-            Layout.preferredHeight: 60
+            Layout.preferredHeight: 40
             spacing: 15
 
             Label {
@@ -276,6 +354,40 @@ Window {
                 color: "white"
                 Layout.preferredWidth: 80
                 horizontalAlignment: Text.AlignRight
+            }
+        }
+
+        // Hounsfield Scale Info
+        ColumnLayout {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 60
+            spacing: 5
+            
+            Label { text: "Hounsfield Scale Reference"; color: "white"; font.bold: true; font.pixelSize: 14 }
+            
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 15
+                gradient: Gradient {
+                    orientation: Gradient.Horizontal
+                    GradientStop { position: 0.0; color: "black" }
+                    GradientStop { position: 1.0; color: "white" }
+                }
+                border.color: "#555"
+                border.width: 1
+            }
+            
+            RowLayout {
+                Layout.fillWidth: true
+                Label { text: "-1000 (Air)"; color: "#ccc"; font.pixelSize: 12; Layout.alignment: Qt.AlignLeft }
+                Item { Layout.fillWidth: true }
+                Label { text: "-100...-50 (Fat)"; color: "#ccc"; font.pixelSize: 12; Layout.alignment: Qt.AlignHCenter }
+                Item { Layout.fillWidth: true }
+                Label { text: "0 (Water)"; color: "#ccc"; font.pixelSize: 12; Layout.alignment: Qt.AlignHCenter }
+                Item { Layout.fillWidth: true }
+                Label { text: "+40...80 (Blood/Muscle)"; color: "#ccc"; font.pixelSize: 12; Layout.alignment: Qt.AlignHCenter }
+                Item { Layout.fillWidth: true }
+                Label { text: "+400...+1000 (Bone)"; color: "#ccc"; font.pixelSize: 12; Layout.alignment: Qt.AlignRight }
             }
         }
     }

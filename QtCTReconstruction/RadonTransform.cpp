@@ -9,17 +9,18 @@ namespace ct {
 
 Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, const size_t detector_bins) {
     Sinogram sino;
-    if (slice.empty() || slice[0].empty() || num_angles == 0 || detector_bins == 0) {
+    if (slice.empty() || slice.width == 0 || slice.height == 0 || num_angles == 0 || detector_bins == 0) {
         return sino;
     }
 
-    const size_t h = slice.size();
-    const size_t w = slice[0].size();
+    const size_t w = slice.width;
+    const size_t h = slice.height;
     const float cx = static_cast<float>(w - 1) * 0.5f;
     const float cy = static_cast<float>(h - 1) * 0.5f;
     const float detector_center = static_cast<float>(detector_bins / 2);
 
-    sino.data.assign(detector_bins, std::vector<float>(num_angles, 0.0f));
+    // x = angle, y = detector_bins
+    sino.data.assign(num_angles, detector_bins, 0.0f);
     sino.angles_deg.resize(num_angles, 0.0f);
     const float angle_step = 180.0f / static_cast<float>(num_angles);
     for (size_t a = 0; a < num_angles; ++a) {
@@ -28,6 +29,8 @@ Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, co
     sino.detector_spacing_mm = 1.0f;
 
     const int na = static_cast<int>(num_angles);
+    
+    // В OpenMP параллелим по углам, так как каждый угол независим и пишет в свой столбец
     #pragma omp parallel for schedule(dynamic)
     for (int a = 0; a < na; ++a) {
         const float th = utils::degToRad(sino.angles_deg[static_cast<size_t>(a)]);

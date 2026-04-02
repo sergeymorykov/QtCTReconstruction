@@ -22,6 +22,11 @@ class CtReconstructionController : public QObject {
     Q_PROPERTY(double sinogramTimeSec READ sinogramTimeSec NOTIFY timingsChanged)
     Q_PROPERTY(double reconTimeSec READ reconTimeSec NOTIFY timingsChanged)
 
+    Q_PROPERTY(int filterType READ filterType WRITE setFilterType NOTIFY filterTypeChanged)
+    Q_PROPERTY(int backendType READ backendType WRITE setBackendType NOTIFY backendTypeChanged)
+    Q_PROPERTY(bool asBuffer READ asBuffer WRITE setAsBuffer NOTIFY asBufferChanged)
+    Q_PROPERTY(bool isDebugBuild READ isDebugBuild CONSTANT)
+
 public:
     explicit CtReconstructionController(QObject* parent = nullptr);
     ~CtReconstructionController() override;
@@ -35,10 +40,21 @@ public:
     double sinogramTimeSec() const;
     double reconTimeSec() const;
 
+    int filterType() const;
+    int backendType() const;
+    bool asBuffer() const;
+    bool isDebugBuild() const;
+
     Q_INVOKABLE void generateVolume();
     Q_INVOKABLE void startReconstruction();
+    Q_INVOKABLE void savePng(int z);
+    Q_INVOKABLE void loadPointCloud();
+    Q_INVOKABLE void extractAndFillPointCloud(QObject* geometry);
 
     void setCurrentZ(int z);
+    void setFilterType(int type);
+    void setBackendType(int type);
+    void setAsBuffer(bool buffer);
 
     QImage imageOriginal(int z) const;
     QImage imageSinogram(int z) const;
@@ -52,6 +68,10 @@ signals:
     void runningChanged();
     void hasVolumeChanged();
     void timingsChanged();
+    void filterTypeChanged();
+    void backendTypeChanged();
+    void asBufferChanged();
+    void sliceUpdated(int index);
 
 private:
     enum class ImageKind { Original, Sinogram, Reconstruction, Difference };
@@ -79,8 +99,11 @@ private:
     static QImage sliceToImage(const ct::Slice& slice, bool difference_map);
     static QImage sinogramToImage(const ct::Sinogram& sinogram);
 
-    static ReconstructionResult generateVolumeTask();
-    static ReconstructionResult reconstructionTask();
+    ReconstructionResult generateVolumeTask();
+    
+    // Non-static to emit signals
+    ReconstructionResult reconstructionTask();
+    
     void applyResult(const ReconstructionResult& result);
     void setRunning(bool running);
     void startAsyncTask(QFutureWatcher<ReconstructionResult>* watcher, const std::function<ReconstructionResult()>& task);
@@ -107,6 +130,10 @@ private:
     ImageVec m_sinogramImagesPtr;
     ImageVec m_reconstructionImagesPtr;
     ImageVec m_differenceImagesPtr;
+
+    int m_filterType = 1; // SheppLogan
+    int m_backendType = 0; // OpenCV/CUDA switch
+    bool m_asBuffer = true;
 
     QPointer<QFutureWatcher<ReconstructionResult>> m_activeWatcher;
 

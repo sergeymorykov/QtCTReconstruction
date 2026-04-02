@@ -53,33 +53,33 @@ float lerp(const float a, const float b, const float t) {
     return a + (b - a) * t;
 }
 
-Slice createSlice(const size_t height, const size_t width, const float value) {
-    return Slice(height, std::vector<float>(width, value));
+Slice createSlice(size_t width, size_t height, float value) {
+    return Slice(width, height, value);
 }
 
 Slice subtract(const Slice& a, const Slice& b) {
-    if (a.size() != b.size() || (!a.empty() && a[0].size() != b[0].size())) {
+    if (a.width != b.width || a.height != b.height) {
         throw std::invalid_argument("Slice size mismatch in subtract");
     }
     Slice out = a;
-    const int rows = static_cast<int>(a.size());
+    const int rows = static_cast<int>(a.height);
     #pragma omp parallel for
     for (int y = 0; y < rows; ++y) {
         const auto yi = static_cast<size_t>(y);
-        for (size_t x = 0; x < a[yi].size(); ++x) {
+        for (size_t x = 0; x < a.width; ++x) {
             out[yi][x] = a[yi][x] - b[yi][x];
         }
     }
     return out;
 }
 
-float bilinearAt(const Slice& image, const float x, const float y, const float out_of_bounds) {
-    if (image.empty() || image[0].empty()) {
+float bilinearAt(const Slice& image, float x, float y, float out_of_bounds) {
+    if (image.empty()) {
         return out_of_bounds;
     }
 
-    const int width = static_cast<int>(image[0].size());
-    const int height = static_cast<int>(image.size());
+    const int width = static_cast<int>(image.width);
+    const int height = static_cast<int>(image.height);
 
     const int x0 = static_cast<int>(std::floor(x));
     const int y0 = static_cast<int>(std::floor(y));

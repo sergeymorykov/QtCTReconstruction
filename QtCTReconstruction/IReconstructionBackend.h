@@ -1,0 +1,46 @@
+#pragma once
+
+#include "CTTypes.h"
+#include <functional>
+#include <memory>
+#include <string>
+
+namespace ct {
+
+class IReconstructionBackend {
+public:
+    virtual ~IReconstructionBackend() = default;
+
+    // Имя бэкенда для UI
+    virtual std::string name() const = 0;
+
+    // Доступен ли данный бэкенд на текущей системе
+    virtual bool isAvailable() const = 0;
+
+    // Выполнение преобразования Радона (создание синограммы из среза)
+    virtual Sinogram computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins) = 0;
+
+    // Выполнение фильтрации и обратной проекции (реконструкция среза из синограммы)
+    virtual Buffer2D reconstructSlice(const Sinogram& sinogram, size_t output_size, const ReconstructionParams& params) = 0;
+
+    // Пакетная параллельная обработка тома с коллбеком для UI ("on-the-fly" update)
+    // Функция запускает процесс и может быть асинхронной или блокирующей.
+    virtual void reconstructVolume(const Volume& input_volume, 
+                                   Volume& out_reconstruction,
+                                   const ReconstructionParams& params,
+                                   std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) = 0;
+
+    // Извлечение облака точек по порогу HU
+    virtual PointCloud extractPointCloud(const Volume& vol, float threshold) = 0;
+};
+
+// Простая фабрика для получения бэкендов
+class BackendFactory {
+public:
+    enum class BackendType { OpenMP, CUDA };
+
+    static std::shared_ptr<IReconstructionBackend> create(BackendType type);
+    static std::shared_ptr<IReconstructionBackend> createBestAvailable();
+};
+
+} // namespace ct

@@ -4,6 +4,8 @@
 
 #include "CtReconstructionController.h"
 #include "CtSliceImageProvider.h"
+#include "PointCloudGeometry.h"
+#include <windows.h>
 
 int main(int argc, char *argv[])
 {
@@ -11,10 +13,24 @@ int main(int argc, char *argv[])
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
 #endif
 
+#ifdef _WIN32
+    SetConsoleOutputCP(1251);
+#endif
+
+    // Используем Fusion-стиль — кросс-платформенный, поддерживает полную кастомизацию элементов QML
+    qputenv("QT_QUICK_CONTROLS_STYLE", "Fusion");
+    // Основной RHI-бэкенд для QQuickWindow
+    qputenv("QSG_RHI_BACKEND", "opengl");
+    // Qt3D использует собственный RHI-контекст; явно переключаем на OpenGL,
+    // иначе он выбирает D3D11 по умолчанию → ошибка "Failed to create input layout"
+    qputenv("QT3D_RENDERER", "opengl");
+
     QGuiApplication app(argc, argv);
 
     // Create the reconstruction controller
     CtReconstructionController controller;
+
+    qmlRegisterType<PointCloudGeometry>("QtCTReconstruction", 1, 0, "PointCloudGeometry");
 
     QQmlApplicationEngine engine;
 
@@ -25,7 +41,7 @@ int main(int argc, char *argv[])
     // Expose controller to QML context
     engine.rootContext()->setContextProperty(QStringLiteral("controller"), &controller);
 
-    engine.load(QUrl(QStringLiteral("qrc:/qt/qml/qtctreconstruction/main.qml")));
+    engine.load(QUrl(QStringLiteral("qrc:/QtCTReconstruction/QtCTReconstruction/main.qml")));
     if (engine.rootObjects().isEmpty())
         return -1;
 

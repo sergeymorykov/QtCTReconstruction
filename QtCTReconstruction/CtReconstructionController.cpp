@@ -8,10 +8,14 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QFileDialog>
 #include <QFuture>
+#include <QGuiApplication>
 #include <QImage>
 #include <QMutexLocker>
 #include <QtConcurrent/QtConcurrentRun>
+#include "IReconstructionBackend.h"
+#include "PointCloudGeometry.h"
 
 #include <algorithm>
 #include <chrono>
@@ -106,6 +110,105 @@ void CtReconstructionController::setCurrentZ(const int z) {
     emit currentZChanged();
 }
 
+int CtReconstructionController::filterType() const { QMutexLocker lock(&m_mutex); return m_filterType; }
+int CtReconstructionController::backendType() const { QMutexLocker lock(&m_mutex); return m_backendType; }
+bool CtReconstructionController::asBuffer() const { QMutexLocker lock(&m_mutex); return m_asBuffer; }
+bool CtReconstructionController::isDebugBuild() const {
+#ifdef NDEBUG
+    return false;
+#else
+    return true;
+#endif
+}
+
+void CtReconstructionController::setFilterType(int type) {
+    {
+        QMutexLocker lock(&m_mutex);
+        if (m_filterType == type) return;
+        m_filterType = type;
+    }
+    emit filterTypeChanged();
+}
+
+void CtReconstructionController::setBackendType(int type) {
+    {
+        QMutexLocker lock(&m_mutex);
+        if (m_backendType == type) return;
+        m_backendType = type;
+    }
+    emit backendTypeChanged();
+}
+
+void CtReconstructionController::setAsBuffer(bool buffer) {
+    {
+        QMutexLocker lock(&m_mutex);
+        if (m_asBuffer == buffer) return;
+        m_asBuffer = buffer;
+    }
+    emit asBufferChanged();
+}
+
+void CtReconstructionController::savePng(int z) {
+    if (!m_ready) return;
+
+    QString outputDirQ = QCoreApplication::applicationDirPath() + "/data/output/slices";
+    QString dir = QFileDialog::getExistingDirectory(nullptr, "Select Output Directory", outputDirQ);
+    if (dir.isEmpty()) return;
+
+    int targetZ = (z >= 0) ? z : currentZ();
+    if (targetZ < 0 || targetZ > m_maxZ) return;
+
+    QImage img = getImage(ImageKind::Reconstruction, targetZ);
+    if (!img.isNull()) {
+        QImage target(img.width(), img.height(), QImage::Format_Grayscale8);
+        for (int y = 0; y < img.height(); ++y) {
+            const QRgb* srcRow = reinterpret_cast<const QRgb*>(img.constScanLine(y));
+            uchar* dstRow = target.scanLine(y);
+            for (int x = 0; x < img.width(); ++x) {
+                dstRow[x] = static_cast<uchar>(qGray(srcRow[x]));
+            }
+        }
+        target.save(dir + QString("/slice_%1.png").arg(targetZ, 4, 10, QChar('0')));
+    }
+}
+
+void CtReconstructionController::loadPointCloud() {
+    qDebug() << "[CT] Load Point Cloud not implemented fully here yet";
+}
+
+void CtReconstructionController::extractAndFillPointCloud(QObject* geometry) {
+    auto* geom = qobject_cast<PointCloudGeometry*>(geometry);
+    if (!geom) {
+        qDebug() << "[CT] Cannot cast geometry to PointCloudGeometry";
+        return;
+    }
+    if (!hasVolume()) {
+        qDebug() << "[CT] No volume to extract points from";
+        return;
+    }
+
+    const QString inputNpy = QCoreApplication::applicationDirPath() + "/data/output/synthetic_brain_hu_cxx.npy";
+    ct::Volume volume;
+    if (!ct::FileIO::loadVolumeNPY(inputNpy.toStdString(), volume, false)) {
+        qDebug() << "[CT] Failed to load volume for extraction";
+        return;
+    }
+
+    int backendId;
+    {
+        QMutexLocker lock(&m_mutex);
+        backendId = m_backendType;
+    }
+
+    auto backendImpl = ct::BackendFactory::create(static_cast<ct::BackendFactory::BackendType>(backendId));
+    if (!backendImpl || !backendImpl->isAvailable()) {
+        backendImpl = ct::BackendFactory::createBestAvailable();
+    }
+
+    ct::PointCloud cloud = backendImpl->extractPointCloud(volume, 400.0f);
+    geom->setPointCloud(cloud);
+}
+
 QImage CtReconstructionController::getImage(const ImageKind kind, const int z) const {
     QMutexLocker lock(&m_mutex);
     if (!m_ready || z < 0) {
@@ -140,19 +243,16 @@ QImage CtReconstructionController::imageReconstruction(const int z) const { retu
 QImage CtReconstructionController::imageDifference(const int z) const { return getImage(ImageKind::Difference, z); }
 
 QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bool difference_map) {
-    if (slice.empty() || slice[0].empty()) {
-        return {};
-    }
-
-    const int width = static_cast<int>(slice[0].size());
-    const int height = static_cast<int>(slice.size());
+    const int width = static_cast<int>(slice.width);
+    const int height = static_cast<int>(slice.height);
     QImage img(width, height, QImage::Format_ARGB32);
     img.fill(0);
 
-    float min_v = slice[0][0];
-    float max_v = slice[0][0];
+    float min_v = slice.empty() ? 0.0f : slice[0][0];
+    float max_v = min_v;
     for (const auto& row : slice) {
-        for (const float v : row) {
+        for (size_t x = 0; x < slice.width; ++x) {
+            const float v = row[x];
             min_v = std::min(min_v, v);
             max_v = std::max(max_v, v);
         }
@@ -183,19 +283,20 @@ QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bo
 }
 
 QImage CtReconstructionController::sinogramToImage(const ct::Sinogram& sinogram) {
-    if (sinogram.data.empty() || sinogram.data[0].empty()) {
+    if (sinogram.data.empty()) {
         return {};
     }
 
-    const int width = static_cast<int>(sinogram.data[0].size());
-    const int height = static_cast<int>(sinogram.data.size());
+    const int width = static_cast<int>(sinogram.data.width);
+    const int height = static_cast<int>(sinogram.data.height);
     QImage img(width, height, QImage::Format_ARGB32);
     img.fill(0);
 
     float min_v = sinogram.data[0][0];
     float max_v = sinogram.data[0][0];
     for (const auto& row : sinogram.data) {
-        for (const float v : row) {
+        for (size_t x = 0; x < sinogram.data.width; ++x) {
+            const float v = row[x];
             min_v = std::min(min_v, v);
             max_v = std::max(max_v, v);
         }
@@ -264,8 +365,7 @@ void CtReconstructionController::generateVolume() {
 
     QPointer<QFutureWatcher<ReconstructionResult>> watcher = new QFutureWatcher<ReconstructionResult>(this);
     m_activeWatcher = watcher;
-    // Use helper to start the async task; pass the static generateVolumeTask
-    startAsyncTask(watcher, &CtReconstructionController::generateVolumeTask);
+    startAsyncTask(watcher, std::bind(&CtReconstructionController::generateVolumeTask, this));
 }
 
 CtReconstructionController::ReconstructionResult CtReconstructionController::generateVolumeTask() {
@@ -286,7 +386,13 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::gen
     double genTime = 0.0;
     std::string outputDirA = outputDir.toStdString();
     std::replace(outputDirA.begin(), outputDirA.end(), '/', '\\');
-    const std::string inputNpyA = outputDirA + "\\synthetic_brain_hu.npy";
+    const std::string inputNpyA = outputDirA + "\\synthetic_brain_hu_cxx.npy";
+
+    int backendId;
+    {
+        QMutexLocker lock(&m_mutex);
+        backendId = m_backendType;
+    }
 
     if (static_cast<bool>(std::ifstream(inputNpyA, std::ios::binary))) {
         result.hasVolume = true;
@@ -294,9 +400,19 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::gen
     } else {
         const auto t_gen_start = std::chrono::steady_clock::now();
         ct::Generator3D::Params gen_params;
-        gen_params.shape = {512, 512, 512};
-        gen_params.num_ellipsoids = 300;
-        const ct::Volume volume = ct::Generator3D::generateBrainHU(gen_params);
+        gen_params.shape = {256, 256, 256}; // Reduced slightly for faster feedback
+        gen_params.num_ellipsoids = 200;
+        
+        ct::Generator3D generator;
+        if (backendId == 1) { // CUDA
+            generator.setBackend(ct::Generator3D::BackendType::CUDA);
+            qDebug() << "[CT] Generator using CUDA backend";
+        } else {
+            generator.setBackend(ct::Generator3D::BackendType::CPU);
+            qDebug() << "[CT] Generator using CPU backend";
+        }
+
+        const ct::Volume volume = generator.generateBrainHU(gen_params);
         const std::string outNpyA = outputDirA + "\\synthetic_brain_hu_cxx.npy";
         ct::FileIO::saveVolumeNPY(volume, outNpyA);
         const auto t_gen_end = std::chrono::steady_clock::now();
@@ -338,9 +454,7 @@ void CtReconstructionController::startReconstruction() {
 
     QPointer<QFutureWatcher<ReconstructionResult>> watcher = new QFutureWatcher<ReconstructionResult>(this);
     m_activeWatcher = watcher;
-    // Start reconstruction in background using startAsyncTask to ensure the finished
-    // handler runs via a queued connection and won't block the GUI thread.
-    startAsyncTask(watcher, &CtReconstructionController::reconstructionTask);
+    startAsyncTask(watcher, std::bind(&CtReconstructionController::reconstructionTask, this));
 }
 
 CtReconstructionController::ReconstructionResult CtReconstructionController::reconstructionTask() {
@@ -349,11 +463,10 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     ReconstructionResult results;
     results.success = false;
 
-    const QString inputNpy = QCoreApplication::applicationDirPath() + "/data/output/synthetic_brain_hu_cxx.npy";
-    const std::wstring inputNpyW = toWStringBackslashPath(inputNpy);
-    const QString outputDirQ = QCoreApplication::applicationDirPath() + "/data/output";
+    const QString inputNpy    = QCoreApplication::applicationDirPath() + "/data/output/synthetic_brain_hu_cxx.npy";
+    const QString outputDirQ  = QCoreApplication::applicationDirPath() + "/data/output";
     const std::wstring outputDirW = toWStringBackslashPath(outputDirQ);
-    const std::string inputNpyA = inputNpy.toStdString();
+    const std::string inputNpyA  = inputNpy.toStdString();
     const std::string outputDirA = outputDirQ.toStdString();
 
     ct::Volume volume;
@@ -362,133 +475,167 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
         return results;
     }
 
-    const int depth = static_cast<int>(volume.data.size());
+    const int depth = static_cast<int>(volume.depth);
     if (depth <= 0) {
         qDebug() << "[CT] computeAll: empty volume";
         return results;
     }
 
     results.hasVolume = true;
-    results.maxZ = depth - 1;
-    results.currentZ = depth / 2;
-    results.originalImages = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
-    results.sinogramImages = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
-    results.reconstructionImages = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
-    results.differenceImages = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
+    results.maxZ      = depth - 1;
+    results.currentZ  = depth / 2;
+    results.originalImages        = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
+    results.sinogramImages        = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
+    results.reconstructionImages  = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
+    results.differenceImages      = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
 
-    const auto t_sino_start = std::chrono::steady_clock::now();
+    // --- Считываем настройки под мьютексом ---
+    int backendId;
+    int filterId;
+    bool asBufferVal;
+    {
+        QMutexLocker lock(&m_mutex);
+        backendId   = m_backendType;
+        filterId    = m_filterType;
+        asBufferVal = m_asBuffer;
+    }
+
+    // --- Параметры реконструкции ---
     ct::ReconstructionParams params = defaultReconstructionParams();
+    if      (filterId == 0) params.filter = ct::ReconstructionParams::FilterType::Ramp;
+    else if (filterId == 1) params.filter = ct::ReconstructionParams::FilterType::SheppLogan;
+    else if (filterId == 2) params.filter = ct::ReconstructionParams::FilterType::Hamming;
+
+    // --- Создаём бэкенд ---
+    auto backendImpl = ct::BackendFactory::create(static_cast<ct::BackendFactory::BackendType>(backendId));
+    qDebug() << "[CT] reconstructionTask requested backendId:" << backendId;
+    if (!backendImpl || !backendImpl->isAvailable()) {
+        qDebug() << "[CT] Requested backend not available, falling back to Best Available";
+        backendImpl = ct::BackendFactory::createBestAvailable();
+    } else {
+        qDebug() << "[CT] Requested backend is available!";
+    }
+
     const int mid_z = depth / 2;
+
+    // Уведомляем UI заранее — так он может отображать данные по мере готовности срезов
+    {
+        QMutexLocker lock(&m_mutex);
+        m_originalImagesPtr        = results.originalImages;
+        m_sinogramImagesPtr        = results.sinogramImages;
+        m_reconstructionImagesPtr  = results.reconstructionImages;
+        m_differenceImagesPtr      = results.differenceImages;
+        m_maxZ     = results.maxZ;
+        m_currentZ = results.currentZ;
+        m_ready    = true;
+    }
+    QMetaObject::invokeMethod(this, "maxZChanged");
+    QMetaObject::invokeMethod(this, "currentZChanged");
+    QMetaObject::invokeMethod(this, "readyChanged");
+
     ct::Slice original_mid;
     ct::Slice recon_mid;
     ct::Slice diff_mid;
 
-    for (int z = 0; z < depth; ++z) {
-        if (z == 0 || z == mid_z || z == depth - 1) {
-            qDebug() << "[CT] computeAll: sinogram slice" << z << "/" << depth;
-        }
-        const size_t zi = static_cast<size_t>(z);
-        const ct::Slice& original = volume.data[zi];
-        ct::Slice normalized = ct::utils::createSlice(original.size(), original[0].size(), 0.0f);
-
+    // ---------------------------------------------------------------
+    // Вспомогательная лямбда нормализации HU → [0, 1]
+    // ---------------------------------------------------------------
+    auto normalizeSlice = [](const ct::Slice& src, ct::Slice& out,
+                             float& hu_min_out, float& hu_max_out) {
         float hu_min = std::numeric_limits<float>::max();
         float hu_max = std::numeric_limits<float>::lowest();
-        for (const auto& row : original) {
-            for (const float v : row) {
+        for (const auto& row : src) {
+            for (size_t x = 0; x < src.width; ++x) {
+                const float v = row[x];
                 hu_min = std::min(hu_min, v);
                 hu_max = std::max(hu_max, v);
             }
         }
+        hu_min_out = hu_min;
+        hu_max_out = hu_max;
+        out.assign(src.width, src.height, 0.0f);
         if (hu_max > hu_min) {
             const float inv_span = 1.0f / (hu_max - hu_min);
-            for (size_t y = 0; y < original.size(); ++y) {
-                for (size_t x = 0; x < original[y].size(); ++x) {
-                    normalized[y][x] = (original[y][x] - hu_min) * inv_span;
+            for (size_t y = 0; y < src.height; ++y) {
+                for (size_t x = 0; x < src.width; ++x) {
+                    out[y][x] = (src[y][x] - hu_min) * inv_span;
                 }
             }
         }
+    };
 
-        const size_t detector_bins = original.size();
-        ct::Sinogram sinogram = ct::RadonTransform::forward(normalized, params.num_angles, detector_bins);
+    // ---------------------------------------------------------------
+    // ЕДИНЫЙ цикл: нормализация → синограмма → реконструкция.
+    // Ранее было два отдельных прохода, что означало двойное вычисление
+    // синограммы для каждого среза (×2 нагрузка на CPU и GPU).
+    // ---------------------------------------------------------------
+    const auto t_total_start = std::chrono::steady_clock::now();
+
+    for (int z = 0; z < depth; ++z) {
+        if (z == 0 || z == mid_z || z == depth - 1) {
+            qDebug() << "[CT] computeAll: processing slice" << z << "/" << depth;
+        }
+
+        const size_t zi = static_cast<size_t>(z);
+        const ct::Slice& original = volume.getSlice(zi);
+
+        // 1. Нормализация HU → [0, 1]
+        float hu_min = 0.0f, hu_max = 0.0f;
+        ct::Slice normalized;
+        normalizeSlice(original, normalized, hu_min, hu_max);
+
+        // 2. Синограмма (один раз на срез!)
+        const size_t detector_bins = original.height;
+        ct::Sinogram sinogram = backendImpl->computeSinogram(normalized, params.num_angles, detector_bins);
         (*results.sinogramImages)[zi] = sinogramToImage(sinogram);
 
         if (z == mid_z) {
-            const auto t_sino_end = std::chrono::steady_clock::now();
-            results.sinogramTimeSec = std::chrono::duration<double>(t_sino_end - t_sino_start).count();
-            qDebug() << "[CT] computeAll: sinogram stage done seconds=" << results.sinogramTimeSec;
-        }
-    }
-
-    if (results.sinogramTimeSec <= 0.0) {
-        const auto t_sino_end = std::chrono::steady_clock::now();
-        results.sinogramTimeSec = std::chrono::duration<double>(t_sino_end - t_sino_start).count();
-    }
-
-    const auto t_recon_start = std::chrono::steady_clock::now();
-    qDebug() << "[CT] computeAll: reconstruction stage start";
-
-    for (int z = 0; z < depth; ++z) {
-        if (z == 0 || z == mid_z || z == depth - 1) {
-            qDebug() << "[CT] computeAll: reconstruction slice" << z << "/" << depth;
+            const auto t_mid = std::chrono::steady_clock::now();
+            results.sinogramTimeSec = std::chrono::duration<double>(t_mid - t_total_start).count();
+            qDebug() << "[CT] computeAll: sinogram stage (mid) done, seconds=" << results.sinogramTimeSec;
         }
 
-        const size_t zi = static_cast<size_t>(z);
-        const ct::Slice& original = volume.data[zi];
+        // 3. Реконструкция из уже готовой синограммы
+        ct::Slice recon_normalized = backendImpl->reconstructSlice(sinogram, original.width, params);
 
-        float hu_min = std::numeric_limits<float>::max();
-        float hu_max = std::numeric_limits<float>::lowest();
-        for (const auto& row : original) {
-            for (const float v : row) {
-                hu_min = std::min(hu_min, v);
-                hu_max = std::max(hu_max, v);
-            }
-        }
-
-        ct::Slice normalized = ct::utils::createSlice(original.size(), original[0].size(), 0.0f);
+        // 4. Денормализация → HU
+        ct::Slice reconstruction(original.width, original.height, hu_min);
         if (hu_max > hu_min) {
-            const float inv_span = 1.0f / (hu_max - hu_min);
-            for (size_t y = 0; y < original.size(); ++y) {
-                for (size_t x = 0; x < original[y].size(); ++x) {
-                    normalized[y][x] = (original[y][x] - hu_min) * inv_span;
-                }
-            }
-        }
-
-        const size_t detector_bins = original.size();
-        ct::Sinogram sinogram = ct::RadonTransform::forward(normalized, params.num_angles, detector_bins);
-        ct::Slice recon_normalized = ct::FilteredBackprojection::reconstruct(sinogram, original.size(), params);
-
-        ct::Slice reconstruction = ct::utils::createSlice(original.size(), original[0].size(), hu_min);
-        if (hu_max > hu_min) {
-            const float span = (hu_max - hu_min);
-            for (size_t y = 0; y < reconstruction.size(); ++y) {
-                for (size_t x = 0; x < reconstruction[y].size(); ++x) {
+            const float span = hu_max - hu_min;
+            for (size_t y = 0; y < reconstruction.height; ++y) {
+                for (size_t x = 0; x < reconstruction.width; ++x) {
                     reconstruction[y][x] = recon_normalized[y][x] * span + hu_min;
                 }
             }
         }
 
         ct::Slice differences = ct::utils::subtract(reconstruction, original);
-        (*results.originalImages)[zi] = sliceToImage(original, false);
+        (*results.originalImages)[zi]       = sliceToImage(original, false);
         (*results.reconstructionImages)[zi] = sliceToImage(reconstruction, false);
-        (*results.differenceImages)[zi] = sliceToImage(differences, true);
+        (*results.differenceImages)[zi]     = sliceToImage(differences, true);
+
+        if (!asBufferVal) {
+            emit sliceUpdated(z);
+        }
 
         if (z == mid_z) {
             original_mid = original;
-            recon_mid = reconstruction;
-            diff_mid = differences;
+            recon_mid    = reconstruction;
+            diff_mid     = differences;
         }
     }
 
-    const auto t_recon_end = std::chrono::steady_clock::now();
-    results.reconTimeSec = std::chrono::duration<double>(t_recon_end - t_recon_start).count();
+    const auto t_total_end = std::chrono::steady_clock::now();
+    const double totalSec = std::chrono::duration<double>(t_total_end - t_total_start).count();
+    results.reconTimeSec = totalSec - results.sinogramTimeSec;
 
+    // --- Метрики качества на среднем срезе ---
     double mse = 0.0;
     size_t cnt = 0;
     float vmin = std::numeric_limits<float>::max();
     float vmax = std::numeric_limits<float>::lowest();
-    for (size_t y = 0; y < diff_mid.size(); ++y) {
-        for (size_t x = 0; x < diff_mid[y].size(); ++x) {
+    for (size_t y = 0; y < diff_mid.height; ++y) {
+        for (size_t x = 0; x < diff_mid.width; ++x) {
             const float d = diff_mid[y][x];
             mse += static_cast<double>(d) * static_cast<double>(d);
             ++cnt;
@@ -498,15 +645,19 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     }
     mse = (cnt > 0) ? (mse / static_cast<double>(cnt)) : 0.0;
     const double range = static_cast<double>(vmax - vmin);
-    const double psnr = (mse <= 0.0 || range <= 0.0) ? std::numeric_limits<double>::infinity() : 10.0 * std::log10((range * range) / mse);
+    const double psnr  = (mse <= 0.0 || range <= 0.0)
+                         ? std::numeric_limits<double>::infinity()
+                         : 10.0 * std::log10((range * range) / mse);
 
-    const std::wstring originalPath = outputDirW + L"\\original_middle.bmp";
+    // --- BMP для анализа ---
+    const std::wstring originalPath       = outputDirW + L"\\original_middle.bmp";
     const std::wstring reconstructionPath = outputDirW + L"\\reconstruction_middle.bmp";
-    const std::wstring differencePath = outputDirW + L"\\difference_middle.bmp";
-    ct::FileIO::saveSliceBMP(original_mid, originalPath, -1000.0f, 100.0f);
-    ct::FileIO::saveSliceBMP(recon_mid, reconstructionPath, -1000.0f, 100.0f);
-    ct::FileIO::saveSliceBMP(diff_mid, differencePath, -200.0f, 200.0f);
+    const std::wstring differencePath     = outputDirW + L"\\difference_middle.bmp";
+    ct::FileIO::saveSliceBMP(original_mid, originalPath,       -1000.0f, 100.0f);
+    ct::FileIO::saveSliceBMP(recon_mid,    reconstructionPath, -1000.0f, 100.0f);
+    ct::FileIO::saveSliceBMP(diff_mid,     differencePath,     -200.0f,  200.0f);
 
+    // --- metrics.txt ---
     const std::string metricsPathA = outputDirA + "\\metrics.txt";
     std::ofstream metrics(metricsPathA, std::ios::out | std::ios::trunc);
     if (metrics.is_open()) {
@@ -515,19 +666,15 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
         metrics << "mid_z=" << mid_z << "\n";
         metrics << "mse=" << mse << "\n";
         metrics << "psnr=";
-        if (std::isfinite(psnr)) {
-            metrics << psnr;
-        } else {
-            metrics << "inf";
-        }
+        if (std::isfinite(psnr)) { metrics << psnr; } else { metrics << "inf"; }
         metrics << "\n--- Timing (seconds) ---\n";
-        metrics << "generation=" << results.genTimeSec << "\n";
-        metrics << "sinogram=" << results.sinogramTimeSec << "\n";
-        metrics << "reconstruction=" << results.reconTimeSec << "\n";
-        metrics << "total=" << (results.genTimeSec + results.sinogramTimeSec + results.reconTimeSec) << "\n";
+        metrics << "generation="     << results.genTimeSec      << "\n";
+        metrics << "sinogram="       << results.sinogramTimeSec << "\n";
+        metrics << "reconstruction=" << results.reconTimeSec    << "\n";
+        metrics << "total="          << (results.genTimeSec + results.sinogramTimeSec + results.reconTimeSec) << "\n";
     }
 
-    results.ready = true;
+    results.ready   = true;
     results.success = true;
     return results;
 }
@@ -535,21 +682,21 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
 void CtReconstructionController::applyResult(const ReconstructionResult& result) {
     {
         QMutexLocker lock(&m_mutex);
-        m_ready = result.ready;
-        m_running = false;
-        m_hasVolume = result.hasVolume;
-        m_maxZ = result.maxZ;
-        m_currentZ = result.currentZ;
-        m_genTimeSec = result.genTimeSec;
-        m_sinogramTimeSec = result.sinogramTimeSec;
-        m_reconTimeSec = result.reconTimeSec;
-        m_originalImagesPtr = result.originalImages;
-        m_sinogramImagesPtr = result.sinogramImages;
-        m_reconstructionImagesPtr = result.reconstructionImages;
-        m_differenceImagesPtr = result.differenceImages;
+        m_ready       = result.ready;
+        m_running     = false;
+        m_hasVolume   = result.hasVolume;
+        m_maxZ        = result.maxZ;
+        m_currentZ    = result.currentZ;
+        m_genTimeSec       = result.genTimeSec;
+        m_sinogramTimeSec  = result.sinogramTimeSec;
+        m_reconTimeSec     = result.reconTimeSec;
+        m_originalImagesPtr        = result.originalImages;
+        m_sinogramImagesPtr        = result.sinogramImages;
+        m_reconstructionImagesPtr  = result.reconstructionImages;
+        m_differenceImagesPtr      = result.differenceImages;
     }
 
-    // Emit signals after releasing the mutex to avoid deadlocks if slots call back into this object.
+    // Сигналы испускаем после снятия мьютекса, чтобы избежать дедлоков
     emit readyChanged();
     emit runningChanged();
     emit hasVolumeChanged();
