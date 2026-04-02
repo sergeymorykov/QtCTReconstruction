@@ -115,17 +115,21 @@ QImage CtReconstructionController::getImage(const ImageKind kind, const int z) c
     const size_t zi = static_cast<size_t>(z);
     switch (kind) {
     case ImageKind::Original:
-        if (zi >= m_originalImages.size()) return makeEmptyImage();
-        return m_originalImages[zi];
+        if (!m_originalImagesPtr) return makeEmptyImage();
+        if (zi >= m_originalImagesPtr->size()) return makeEmptyImage();
+        return (*m_originalImagesPtr)[zi];
     case ImageKind::Sinogram:
-        if (zi >= m_sinogramImages.size()) return makeEmptyImage();
-        return m_sinogramImages[zi];
+        if (!m_sinogramImagesPtr) return makeEmptyImage();
+        if (zi >= m_sinogramImagesPtr->size()) return makeEmptyImage();
+        return (*m_sinogramImagesPtr)[zi];
     case ImageKind::Reconstruction:
-        if (zi >= m_reconstructionImages.size()) return makeEmptyImage();
-        return m_reconstructionImages[zi];
+        if (!m_reconstructionImagesPtr) return makeEmptyImage();
+        if (zi >= m_reconstructionImagesPtr->size()) return makeEmptyImage();
+        return (*m_reconstructionImagesPtr)[zi];
     case ImageKind::Difference:
-        if (zi >= m_differenceImages.size()) return makeEmptyImage();
-        return m_differenceImages[zi];
+        if (!m_differenceImagesPtr) return makeEmptyImage();
+        if (zi >= m_differenceImagesPtr->size()) return makeEmptyImage();
+        return (*m_differenceImagesPtr)[zi];
     }
     return makeEmptyImage();
 }
@@ -249,15 +253,26 @@ void CtReconstructionController::startAsyncTask(QFutureWatcher<ReconstructionRes
 }
 
 void CtReconstructionController::generateVolume() {
-    {
-        QMutexLocker lock(&m_mutex);
-        if (m_running) {
-            return;
-        }
-        m_running = true;
+    QMutexLocker lock(&m_mutex);
+    if (m_running) {
+        return;
     }
+    m_running = true;
+    lock.unlock();
 
     emit runningChanged();
+
+    QPointer<QFutureWatcher<ReconstructionResult>> watcher = new QFutureWatcher<ReconstructionResult>(this);
+    m_activeWatcher = watcher;
+    // Use helper to start the async task; pass the static generateVolumeTask
+    startAsyncTask(watcher, &CtReconstructionController::generateVolumeTask);
+}
+
+CtReconstructionController::ReconstructionResult CtReconstructionController::generateVolumeTask() {
+    ReconstructionResult result;
+    result.success = false;
+    result.hasVolume = false;
+    result.ready = false;
 
     const QString appDir = QCoreApplication::applicationDirPath();
     const QString dataDir = appDir + "/data";
@@ -268,15 +283,14 @@ void CtReconstructionController::generateVolume() {
     ct::utils::ensureDirectory(dataDirW);
     ct::utils::ensureDirectory(outputDirW);
 
-    ReconstructionResult result;
     double genTime = 0.0;
-    bool hasVolume = false;
     std::string outputDirA = outputDir.toStdString();
     std::replace(outputDirA.begin(), outputDirA.end(), '/', '\\');
     const std::string inputNpyA = outputDirA + "\\synthetic_brain_hu.npy";
 
     if (static_cast<bool>(std::ifstream(inputNpyA, std::ios::binary))) {
-        hasVolume = true;
+        result.hasVolume = true;
+        result.success = true;
     } else {
         const auto t_gen_start = std::chrono::steady_clock::now();
         ct::Generator3D::Params gen_params;
@@ -287,18 +301,12 @@ void CtReconstructionController::generateVolume() {
         ct::FileIO::saveVolumeNPY(volume, outNpyA);
         const auto t_gen_end = std::chrono::steady_clock::now();
         genTime = std::chrono::duration<double>(t_gen_end - t_gen_start).count();
-        hasVolume = true;
+        result.hasVolume = true;
+        result.success = true;
     }
 
-    {
-        QMutexLocker lock(&m_mutex);
-        m_genTimeSec = genTime;
-        m_hasVolume = hasVolume;
-        m_running = false;
-    }
-    emit hasVolumeChanged();
-    emit timingsChanged();
-    emit runningChanged();
+    result.genTimeSec = genTime;
+    return result;
 }
 
 void CtReconstructionController::startReconstruction() {
@@ -330,17 +338,9 @@ void CtReconstructionController::startReconstruction() {
 
     QPointer<QFutureWatcher<ReconstructionResult>> watcher = new QFutureWatcher<ReconstructionResult>(this);
     m_activeWatcher = watcher;
-    connect(watcher, &QFutureWatcher<ReconstructionResult>::finished, this, [this, watcher]() {
-        const ReconstructionResult result = watcher ? watcher->result() : ReconstructionResult{};
-        applyResult(result);
-        if (m_activeWatcher == watcher) {
-            m_activeWatcher = nullptr;
-        }
-        if (watcher) {
-            watcher->deleteLater();
-        }
-    });
-    watcher->setFuture(QtConcurrent::run(&CtReconstructionController::reconstructionTask));
+    // Start reconstruction in background using startAsyncTask to ensure the finished
+    // handler runs via a queued connection and won't block the GUI thread.
+    startAsyncTask(watcher, &CtReconstructionController::reconstructionTask);
 }
 
 CtReconstructionController::ReconstructionResult CtReconstructionController::reconstructionTask() {
@@ -371,10 +371,10 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     results.hasVolume = true;
     results.maxZ = depth - 1;
     results.currentZ = depth / 2;
-    results.originalImages.resize(static_cast<size_t>(depth));
-    results.sinogramImages.resize(static_cast<size_t>(depth));
-    results.reconstructionImages.resize(static_cast<size_t>(depth));
-    results.differenceImages.resize(static_cast<size_t>(depth));
+    results.originalImages = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
+    results.sinogramImages = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
+    results.reconstructionImages = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
+    results.differenceImages = std::make_shared<std::vector<QImage>>(static_cast<size_t>(depth));
 
     const auto t_sino_start = std::chrono::steady_clock::now();
     ct::ReconstructionParams params = defaultReconstructionParams();
@@ -410,7 +410,7 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
 
         const size_t detector_bins = original.size();
         ct::Sinogram sinogram = ct::RadonTransform::forward(normalized, params.num_angles, detector_bins);
-        results.sinogramImages[zi] = sinogramToImage(sinogram);
+        (*results.sinogramImages)[zi] = sinogramToImage(sinogram);
 
         if (z == mid_z) {
             const auto t_sino_end = std::chrono::steady_clock::now();
@@ -469,9 +469,9 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
         }
 
         ct::Slice differences = ct::utils::subtract(reconstruction, original);
-        results.originalImages[zi] = sliceToImage(original, false);
-        results.reconstructionImages[zi] = sliceToImage(reconstruction, false);
-        results.differenceImages[zi] = sliceToImage(differences, true);
+        (*results.originalImages)[zi] = sliceToImage(original, false);
+        (*results.reconstructionImages)[zi] = sliceToImage(reconstruction, false);
+        (*results.differenceImages)[zi] = sliceToImage(differences, true);
 
         if (z == mid_z) {
             original_mid = original;
@@ -533,20 +533,23 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
 }
 
 void CtReconstructionController::applyResult(const ReconstructionResult& result) {
-    QMutexLocker lock(&m_mutex);
-    m_ready = result.ready;
-    m_running = false;
-    m_hasVolume = result.hasVolume;
-    m_maxZ = result.maxZ;
-    m_currentZ = result.currentZ;
-    m_genTimeSec = result.genTimeSec;
-    m_sinogramTimeSec = result.sinogramTimeSec;
-    m_reconTimeSec = result.reconTimeSec;
-    m_originalImages = result.originalImages;
-    m_sinogramImages = result.sinogramImages;
-    m_reconstructionImages = result.reconstructionImages;
-    m_differenceImages = result.differenceImages;
+    {
+        QMutexLocker lock(&m_mutex);
+        m_ready = result.ready;
+        m_running = false;
+        m_hasVolume = result.hasVolume;
+        m_maxZ = result.maxZ;
+        m_currentZ = result.currentZ;
+        m_genTimeSec = result.genTimeSec;
+        m_sinogramTimeSec = result.sinogramTimeSec;
+        m_reconTimeSec = result.reconTimeSec;
+        m_originalImagesPtr = result.originalImages;
+        m_sinogramImagesPtr = result.sinogramImages;
+        m_reconstructionImagesPtr = result.reconstructionImages;
+        m_differenceImagesPtr = result.differenceImages;
+    }
 
+    // Emit signals after releasing the mutex to avoid deadlocks if slots call back into this object.
     emit readyChanged();
     emit runningChanged();
     emit hasVolumeChanged();

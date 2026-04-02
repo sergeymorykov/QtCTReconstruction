@@ -66,10 +66,11 @@ public:
         double genTimeSec = 0.0;
         double sinogramTimeSec = 0.0;
         double reconTimeSec = 0.0;
-        std::vector<QImage> originalImages;
-        std::vector<QImage> sinogramImages;
-        std::vector<QImage> reconstructionImages;
-        std::vector<QImage> differenceImages;
+        using ImageVec = std::shared_ptr<std::vector<QImage>>;
+        ImageVec originalImages;
+        ImageVec sinogramImages;
+        ImageVec reconstructionImages;
+        ImageVec differenceImages;
     };
 
 private:
@@ -101,6 +102,11 @@ private:
     std::vector<QImage> m_sinogramImages;
     std::vector<QImage> m_reconstructionImages;
     std::vector<QImage> m_differenceImages;
+    using ImageVec = std::shared_ptr<std::vector<QImage>>;
+    ImageVec m_originalImagesPtr;
+    ImageVec m_sinogramImagesPtr;
+    ImageVec m_reconstructionImagesPtr;
+    ImageVec m_differenceImagesPtr;
 
     QPointer<QFutureWatcher<ReconstructionResult>> m_activeWatcher;
 
