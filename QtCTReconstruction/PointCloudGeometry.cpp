@@ -2,7 +2,9 @@
 #include <QByteArray>
 #include <QColor>
 #include <QVector3D>
+#include <QtGlobal>
 #include <algorithm>
+#include <cfloat>
 
 #pragma pack(push, 1)
 struct VertexData {
@@ -44,8 +46,34 @@ void PointCloudGeometry::setPointCloud(const ct::PointCloud& cloud) {
         m_vertexBuffer->setData(QByteArray());
         m_positionAttribute->setCount(0);
         m_colorAttribute->setCount(0);
+        m_hasData = false;
+        emit boundsChanged();
         return;
     }
+
+    // === ВЫЧИСЛЕНИЕ BOUNDING BOX ===
+    QVector3D minPos(FLT_MAX, FLT_MAX, FLT_MAX);
+    QVector3D maxPos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+
+    for (const auto& p : cloud) {
+        QVector3D pos(p.x, p.y, p.z);
+        minPos = QVector3D(qMin(minPos.x(), pos.x()),
+                          qMin(minPos.y(), pos.y()),
+                          qMin(minPos.z(), pos.z()));
+        maxPos = QVector3D(qMax(maxPos.x(), pos.x()),
+                          qMax(maxPos.y(), pos.y()),
+                          qMax(maxPos.z(), pos.z()));
+    }
+
+    m_boundsCenter = (minPos + maxPos) * 0.5f;
+    // Меняем центр boundsCenter в соответствии с новой ориентацией осей: (x, z, y)
+    m_boundsCenter = QVector3D(m_boundsCenter.x(), m_boundsCenter.z(), m_boundsCenter.y());
+
+    QVector3D extent = maxPos - minPos;
+    m_boundsRadius = std::max({extent.x(), extent.y(), extent.z()}) * 0.6f;
+    m_hasData = true;
+    emit boundsChanged();
+    // === КОНЕЦ ВЫЧИСЛЕНИЯ ===
 
     QByteArray bufferData;
     bufferData.resize(cloud.size() * sizeof(VertexData));
@@ -53,15 +81,13 @@ void PointCloudGeometry::setPointCloud(const ct::PointCloud& cloud) {
 
     for (size_t i = 0; i < cloud.size(); ++i) {
         const ct::Point& p = cloud[i];
-        vertices[i].position = QVector3D(p.x, p.y, p.z);
+        // Новая ориентация: Y - это номер среза (высота), Z - глубина (строка изображения)
+        vertices[i].position = QVector3D(p.x, p.z, p.y);
 
-        // Расчет цвета (кости: белый, оттенки серого, мягкие ткани: красные/желтые)
-        float n = std::clamp((p.hu + 200.0f) / 1200.0f, 0.0f, 1.0f);
-        // Простой градиент от красного (мягкие) до белого (кости)
-        float r = std::clamp(n + 0.3f, 0.0f, 1.0f);
-        float g = std::clamp(n, 0.0f, 1.0f);
-        float b = std::clamp(n, 0.0f, 1.0f);
-        vertices[i].color = QVector3D(r, g, b);
+        // 8-bit Gray: нормализуем диапазон HU [-1000, 1000] в [0, 1]
+        // Воздух (-1000) - черный, Мягкие ткани (0) - серый, Кости (400+) - белый
+        float n = std::clamp((p.hu + 1000.0f) / 2000.0f, 0.0f, 1.0f);
+        vertices[i].color = QVector3D(n, n, n);
     }
 
     m_vertexBuffer->setData(bufferData);

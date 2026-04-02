@@ -13,6 +13,7 @@ Window {
 
     property string imagePrefix: controller.ready ? "image://ct/" : ""
     property real updateTicker: 0
+    property var pointCloudWindow: null
 
     Connections {
         target: controller
@@ -127,10 +128,12 @@ Window {
                 onClicked: {
                     var component = Qt.createComponent("PointCloudWindow.qml");
                     if (component.status === Component.Ready) {
-                        // null-родитель обязателен для отдельного Window;
-                        // с root-родителем Scene3D не попадает в graphics scene
-                        var pointCloudWindow = component.createObject(null, {"ctController": controller});
-                        pointCloudWindow.show();
+                        // Сохраняем ссылку в root, чтобы Garbage Collector не закрыл окно
+                        if (root.pointCloudWindow) {
+                            root.pointCloudWindow.destroy();
+                        }
+                        root.pointCloudWindow = component.createObject(null, {"ctController": controller});
+                        root.pointCloudWindow.show();
                     } else if (component.status === Component.Error) {
                         console.error("Error loading PointCloudWindow:", component.errorString());
                     }
