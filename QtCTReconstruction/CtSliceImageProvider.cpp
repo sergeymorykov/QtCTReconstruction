@@ -12,8 +12,16 @@ bool parseId(const QString& id, QString& kindOut, int& zOut) {
         return false;
     }
     kindOut = parts[0];
+    
+    // Strip query string if present (e.g. ?t=0.123)
+    QString zStr = parts[1];
+    const int qMarkPos = zStr.indexOf('?');
+    if (qMarkPos != -1) {
+        zStr = zStr.left(qMarkPos);
+    }
+    
     bool ok = false;
-    zOut = parts[1].toInt(&ok);
+    zOut = zStr.toInt(&ok);
     return ok;
 }
 } // namespace

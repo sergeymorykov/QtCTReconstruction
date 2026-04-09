@@ -73,6 +73,7 @@ qt_add_qml_module(${PROJECT_NAME}
     QML_FILES
         QtCTReconstruction/main.qml
         QtCTReconstruction/PointCloudWindow.qml
+        QtCTReconstruction/ImageWithAxes.qml
 )
 
 # Configurations for Debug/Release specifics if needed in C++

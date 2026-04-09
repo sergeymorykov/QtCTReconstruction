@@ -1,5 +1,7 @@
 <RCC>
-    <qresource prefix="/qt/qml/qtctreconstruction">
+    <qresource prefix="/QtCTReconstruction/QtCTReconstruction">
         <file>main.qml</file>
+        <file>ImageWithAxes.qml</file>
+        <file>PointCloudWindow.qml</file>
     </qresource>
 </RCC>

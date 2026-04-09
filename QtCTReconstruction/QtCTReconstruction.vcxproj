@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -116,6 +116,8 @@
     <ClCompile Include="Utils.cpp" />
     <QtRcc Include="qml.qrc" />
     <None Include="main.qml" />
+    <None Include="ImageWithAxes.qml" />
+    <None Include="PointCloudWindow.qml" />
   </ItemGroup>
   <ItemGroup>
     <QtMoc Include="CtReconstructionController.h" />

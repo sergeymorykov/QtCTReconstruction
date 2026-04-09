@@ -285,24 +285,28 @@ Gdiplus::Bitmap* AppWindow::sliceToBitmap(const ct::Slice& slice, const bool dif
         max_v = min_v + 1.0f;
     }
 
+    const float span = max_v - min_v;
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             const float v = slice[static_cast<size_t>(height - 1 - y)][static_cast<size_t>(x)];
-            if (!difference_map) {
-                const float n = ct::utils::clamp((v - min_v) / (max_v - min_v), 0.0f, 1.0f);
-                const BYTE c = static_cast<BYTE>(n * 255.0f);
-                bmp->SetPixel(x, y, Gdiplus::Color(255, c, c, c));
+
+            float n;
+            if (difference_map) {
+                // Модуль разницы в фиксированном диапазоне 0—50 HU
+                n = ct::utils::clamp(std::abs(v) / 50.0f, 0.0f, 1.0f);
             } else {
-                const float n = ct::utils::clamp(v / 50.0f, -1.0f, 1.0f);
-                const BYTE r = static_cast<BYTE>(n > 0.0f ? n * 255.0f : 0.0f);
-                const BYTE b = static_cast<BYTE>(n < 0.0f ? -n * 255.0f : 0.0f);
-                const BYTE g = static_cast<BYTE>(255 - std::max(r, b));
-                bmp->SetPixel(x, y, Gdiplus::Color(255, r, g, b));
+                // Обычная нормализация
+                n = ct::utils::clamp((v - min_v) / span, 0.0f, 1.0f);
             }
+
+            const BYTE c = static_cast<BYTE>(n * 255.0f);
+            bmp->SetPixel(x, y, Gdiplus::Color(255, c, c, c));
         }
     }
     return bmp;
 }
+
+
 
 Gdiplus::Bitmap* AppWindow::sinogramToBitmap(const ct::Sinogram& sinogram) {
     if (sinogram.data.empty()) {

@@ -16,6 +16,8 @@ std::vector<float> FilterDesign::createFilter(const size_t n, const Reconstructi
         return ramp(n);
     case ReconstructionParams::FilterType::Hamming:
         return hamming(n);
+    case ReconstructionParams::FilterType::Cosine:
+        return cosine(n);
     case ReconstructionParams::FilterType::SheppLogan:
     default:
         return sheppLogan(n);
@@ -78,6 +80,21 @@ std::vector<float> FilterDesign::hamming(const size_t n) {
         const double freq = (ki <= n / 2) ? static_cast<double>(ki) / static_cast<double>(n)
                                           : static_cast<double>(static_cast<long long>(ki) - static_cast<long long>(n)) / static_cast<double>(n);
         const double window = 0.54 + 0.46 * std::cos(kPi * freq / W);
+        filter[ki] = static_cast<float>(filter[ki] * window);
+    }
+    filter[0] = 0.0f;
+    return filter;
+}
+
+std::vector<float> FilterDesign::cosine(const size_t n) {
+    auto filter = ramp(n);
+    const int nn = static_cast<int>(n);
+    #pragma omp parallel for
+    for (int k = 0; k < nn; ++k) {
+        const auto ki = static_cast<size_t>(k);
+        const double freq = (ki <= n / 2) ? static_cast<double>(ki) / static_cast<double>(n)
+                                          : static_cast<double>(static_cast<long long>(ki) - static_cast<long long>(n)) / static_cast<double>(n);
+        const double window = std::cos(kPi * freq);
         filter[ki] = static_cast<float>(filter[ki] * window);
     }
     filter[0] = 0.0f;

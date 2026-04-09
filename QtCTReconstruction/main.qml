@@ -2,6 +2,7 @@ import QtQuick 2.9
 import QtQuick.Controls 2.2
 import QtQuick.Layouts 1.3
 import QtQuick.Window 2.2
+import "."
 
 Window {
     id: root
@@ -11,9 +12,9 @@ Window {
     title: "CT Reconstruction Viewer"
     color: "#1e1e1e"
 
-    property string imagePrefix: controller.ready ? "image://ct/" : ""
     property real updateTicker: 0
     property var pointCloudWindow: null
+    property int popupImageIndex: -1
 
     Connections {
         target: controller
@@ -92,7 +93,7 @@ Window {
 
             Label { text: "Filter:"; color: "white" }
             ComboBox {
-                model: ["Ramp", "Shepp-Logan", "Hamming"]
+                model: ["Ramp", "Shepp-Logan", "Hamming", "Cosine"]
                 currentIndex: controller.filterType
                 onCurrentIndexChanged: controller.filterType = currentIndex
                 implicitWidth: 150
@@ -196,131 +197,53 @@ Window {
             rowSpacing: 10
 
             // Original slice
-            ColumnLayout {
+            ImageWithAxes {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                spacing: 5
-
-                Label {
-                    text: "Original"
-                    font.pixelSize: 16
-                    font.bold: true
-                    color: "#64b5f6"
-                    Layout.preferredHeight: 25
-                }
-
-                Image {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    fillMode: Image.PreserveAspectFit
-                    smooth: true
-                    source: controller.ready ? (imagePrefix + "original/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                    cache: false
-
-                    Rectangle {
-                        anchors.fill: parent
-                        color: "transparent"
-                        border.width: 2
-                        border.color: "#64b5f6"
-                        visible: controller.ready
-                    }
-                }
+                title: "Original"
+                accentColor: "#64b5f6"
+                source: controller.ready ? ("image://ct/original/" + controller.currentZ + "?t=" + root.updateTicker) : ""
+                xMin: -128; xMax: 128; yMin: -128; yMax: 128
+                xLabel: "X [px]"; yLabel: "Y [px]"
+                onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 0 }); }
             }
 
             // Sinogram
-            ColumnLayout {
+            ImageWithAxes {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                spacing: 5
-
-                Label {
-                    text: "Sinogram"
-                    font.pixelSize: 16
-                    font.bold: true
-                    color: "#81c784"
-                    Layout.preferredHeight: 25
-                }
-
-                Image {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    fillMode: Image.PreserveAspectFit
-                    smooth: true
-                    source: controller.ready ? (imagePrefix + "sinogram/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                    cache: false
-
-                    Rectangle {
-                        anchors.fill: parent
-                        color: "transparent"
-                        border.width: 2
-                        border.color: "#81c784"
-                        visible: controller.ready
-                    }
-                }
+                title: "Sinogram"
+                accentColor: "#81c784"
+                source: controller.ready ? ("image://ct/sinogram/" + controller.currentZ + "?t=" + root.updateTicker) : ""
+                xMin: 0; xMax: 180; yMin: -128; yMax: 128
+                xLabel: "Angle [deg]"; yLabel: "Detector Pos [px]"
+                stretchX: true
+                onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 1 }); }
             }
 
             // Reconstruction
-            ColumnLayout {
+            ImageWithAxes {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                spacing: 5
-
-                Label {
-                    text: "Reconstruction"
-                    font.pixelSize: 16
-                    font.bold: true
-                    color: "#ffb74d"
-                    Layout.preferredHeight: 25
-                }
-
-                Image {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    fillMode: Image.PreserveAspectFit
-                    smooth: true
-                    source: controller.ready ? (imagePrefix + "reconstruction/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                    cache: false
-
-                    Rectangle {
-                        anchors.fill: parent
-                        color: "transparent"
-                        border.width: 2
-                        border.color: "#ffb74d"
-                        visible: controller.ready
-                    }
-                }
+                title: "Reconstruction"
+                accentColor: "#ffb74d"
+                source: controller.ready ? ("image://ct/reconstruction/" + controller.currentZ + "?t=" + root.updateTicker) : ""
+                xMin: -128; xMax: 128; yMin: -128; yMax: 128
+                xLabel: "X [px]"; yLabel: "Y [px]"
+                onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 2 }); }
             }
 
             // Difference
-            ColumnLayout {
+            ImageWithAxes {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                spacing: 5
-
-                Label {
-                    text: "Difference"
-                    font.pixelSize: 16
-                    font.bold: true
-                    color: "#e57373"
-                    Layout.preferredHeight: 25
-                }
-
-                Image {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    fillMode: Image.PreserveAspectFit
-                    smooth: true
-                    source: controller.ready ? (imagePrefix + "difference/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                    cache: false
-
-                    Rectangle {
-                        anchors.fill: parent
-                        color: "transparent"
-                        border.width: 2
-                        border.color: "#e57373"
-                        visible: controller.ready
-                    }
-                }
+                title: "Difference"
+                accentColor: "#aaaaaa"
+                source: controller.ready ? ("image://ct/difference/" + controller.currentZ + "?t=" + root.updateTicker) : ""
+                xMin: -128; xMax: 128; yMin: -128; yMax: 128
+                xLabel: "X [px]"; yLabel: "Y [px]"
+                showColorScale: true
+                onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 3 }); }
             }
         }
 
@@ -394,4 +317,61 @@ Window {
             }
         }
     }
+
+    Component {
+        id: popupWindowComponent
+        Window {
+            id: instancedWindow
+            visible: true
+            width: 800
+            height: 800
+            color: "#1e1e1e"
+            
+            // This property maps to the component that requested the window
+            property int popupImageIndex: 0
+            
+            title: (popupImage.title !== "" ? popupImage.title : "Detailed View") + " - Slice " + controller.currentZ
+
+            ImageWithAxes {
+                id: popupImage
+                anchors.fill: parent
+                anchors.margins: 15
+                
+                title: {
+                    if (instancedWindow.popupImageIndex === 0) return "Original";
+                    if (instancedWindow.popupImageIndex === 1) return "Sinogram";
+                    if (instancedWindow.popupImageIndex === 2) return "Reconstruction";
+                    if (instancedWindow.popupImageIndex === 3) return "Difference";
+                    return "";
+                }
+                accentColor: {
+                    if (instancedWindow.popupImageIndex === 0) return "#64b5f6";
+                    if (instancedWindow.popupImageIndex === 1) return "#81c784";
+                    if (instancedWindow.popupImageIndex === 2) return "#ffb74d";
+                    if (instancedWindow.popupImageIndex === 3) return "#aaaaaa";
+                    return "#fff";
+                }
+                source: {
+                    if (!controller.ready || instancedWindow.popupImageIndex < 0) return "";
+                    if (instancedWindow.popupImageIndex === 0) return "image://ct/original/" + controller.currentZ + "?t=" + root.updateTicker;
+                    if (instancedWindow.popupImageIndex === 1) return "image://ct/sinogram/" + controller.currentZ + "?t=" + root.updateTicker;
+                    if (instancedWindow.popupImageIndex === 2) return "image://ct/reconstruction/" + controller.currentZ + "?t=" + root.updateTicker;
+                    if (instancedWindow.popupImageIndex === 3) return "image://ct/difference/" + controller.currentZ + "?t=" + root.updateTicker;
+                    return "";
+                }
+                
+                xMin: (instancedWindow.popupImageIndex === 1) ? 0 : -128
+                xMax: (instancedWindow.popupImageIndex === 1) ? 180 : 128
+                yMin: -128
+                yMax: 128
+                
+                xLabel: (instancedWindow.popupImageIndex === 1) ? "Angle [deg]" : "X [px]"
+                yLabel: (instancedWindow.popupImageIndex === 1) ? "Detector Pos [px]" : "Y [px]"
+                
+                stretchX: (instancedWindow.popupImageIndex === 1)
+                showColorScale: (instancedWindow.popupImageIndex === 3)
+            }
+        }
+    }
 }
+

@@ -245,7 +245,9 @@ QImage CtReconstructionController::imageDifference(const int z) const { return g
 QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bool difference_map) {
     const int width = static_cast<int>(slice.width);
     const int height = static_cast<int>(slice.height);
-    QImage img(width, height, QImage::Format_ARGB32);
+
+    // Для разницы используем честный 8-bit Gray формат
+    QImage img(width, height, difference_map ? QImage::Format_Grayscale8 : QImage::Format_ARGB32);
     img.fill(0);
 
     float min_v = slice.empty() ? 0.0f : slice[0][0];
@@ -261,26 +263,35 @@ QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bo
         max_v = min_v + 1.0f;
     }
 
+    const float span = max_v - min_v;
     for (int y = 0; y < height; ++y) {
-        auto* rowPtr = reinterpret_cast<QRgb*>(img.scanLine(y));
+        uchar* scanLine = img.scanLine(y);
         for (int x = 0; x < width; ++x) {
             const float v = slice[static_cast<size_t>(height - 1 - y)][static_cast<size_t>(x)];
-            if (!difference_map) {
-                const float n = ct::utils::clamp((v - min_v) / (max_v - min_v), 0.0f, 1.0f);
-                const int c = static_cast<int>(n * 255.0f);
-                rowPtr[x] = qRgb(c, c, c);
+
+            float n;
+            if (difference_map) {
+                // Модуль разницы в фиксированном диапазоне 0—50 HU
+                n = ct::utils::clamp(std::abs(v) / 50.0f, 0.0f, 1.0f);
             } else {
-                const float n = ct::utils::clamp(v / 50.0f, -1.0f, 1.0f);
-                const int r = static_cast<int>((n > 0.0f) ? n * 255.0f : 0.0f);
-                const int b = static_cast<int>((n < 0.0f) ? -n * 255.0f : 0.0f);
-                const int g = 255 - std::max(r, b);
-                rowPtr[x] = qRgb(r, g, b);
+                // Обычная нормализация для остальных типов изображений
+                n = ct::utils::clamp((v - min_v) / span, 0.0f, 1.0f);
+            }
+
+            const int c = static_cast<int>(n * 255.0f);
+
+            if (difference_map) {
+                scanLine[x] = static_cast<uchar>(c);
+            } else {
+                reinterpret_cast<QRgb*>(scanLine)[x] = qRgb(c, c, c);
             }
         }
     }
 
+
     return img;
 }
+
 
 QImage CtReconstructionController::sinogramToImage(const ct::Sinogram& sinogram) {
     if (sinogram.data.empty()) {
@@ -505,6 +516,7 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     if      (filterId == 0) params.filter = ct::ReconstructionParams::FilterType::Ramp;
     else if (filterId == 1) params.filter = ct::ReconstructionParams::FilterType::SheppLogan;
     else if (filterId == 2) params.filter = ct::ReconstructionParams::FilterType::Hamming;
+    else if (filterId == 3) params.filter = ct::ReconstructionParams::FilterType::Cosine;
 
     // --- Создаём бэкенд ---
     auto backendImpl = ct::BackendFactory::create(static_cast<ct::BackendFactory::BackendType>(backendId));
