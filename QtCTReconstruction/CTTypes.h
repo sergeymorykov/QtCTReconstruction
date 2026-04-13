@@ -132,6 +132,8 @@ struct Sinogram {
     Buffer2D data; // width = num_angles, height = detector_bins
     std::vector<float> angles_deg;
     float detector_spacing_mm = 1.0f;
+    float original_min_hu = 0.0f;
+    float original_max_hu = 0.0f;
 };
 
 struct ReconstructionParams {

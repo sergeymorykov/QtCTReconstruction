@@ -16,6 +16,8 @@
 #include <thrust/count.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
+#include <thrust/extrema.h>
+#include <thrust/device_ptr.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -32,6 +34,50 @@ namespace {
             std::cerr << "CUDA Error: " << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
         } \
     } while(0)
+
+// Нормализация in-place на GPU
+__global__ void normalizeGPUKernel(float* data, int n, float vmin, float inv_span) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] = (data[i] - vmin) * inv_span;
+}
+
+// Денормализация in-place на GPU
+__global__ void denormalizeGPUKernel(float* data, int n, float vmin, float span) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] = data[i] * span + vmin;
+}
+
+__global__ void packSinogramKernel(
+    const float* __restrict__ sino_src,
+    float*       __restrict__ sino_dst,
+    int num_angles, int detector_bins, int projection_size_padded, int pad_before)
+{
+    int angle = blockIdx.x * blockDim.x + threadIdx.x;
+    int bin   = blockIdx.y * blockDim.y + threadIdx.y;
+    if (angle >= num_angles || bin >= detector_bins) return;
+
+    float val = sino_src[bin * num_angles + angle];
+    sino_dst[angle * projection_size_padded + (bin + pad_before)] = val;
+}
+
+__global__ void transposeScaleKernel(
+    const float* __restrict__ src,
+    float*       __restrict__ dst,
+    int num_angles, int projection_size_padded, int square_bins, float scale)
+{
+    __shared__ float tile[32][33]; 
+    int ax = blockIdx.x * 32 + threadIdx.x;
+    int ay = blockIdx.y * 32 + threadIdx.y;
+
+    if (ax < num_angles && ay < square_bins)
+        tile[threadIdx.y][threadIdx.x] = src[ax * projection_size_padded + ay] * scale;
+    __syncthreads();
+
+    int tx = blockIdx.y * 32 + threadIdx.x;
+    int ty = blockIdx.x * 32 + threadIdx.y;
+    if (tx < square_bins && ty < num_angles)
+        dst[tx * num_angles + ty] = tile[threadIdx.x][threadIdx.y];
+}
 
 __global__ void radonForwardKernel(
     const float* __restrict__ slice,
@@ -51,32 +97,19 @@ __global__ void radonForwardKernel(
     float s = sinf(th);
 
     float sum = 0.0f;
-
-    // В прямом проецировании мы интегрируем вдоль луча.
-    // Проходим по всему изображению и сбрасываем вес в бины.
-    // Это scatter, что не очень эффективно для GPU (нужны atomicAdd).
-    // Поэтому инвертируем цикл для каждого луча. 
-    // Для каждого (angle, bin) считаем луч и берем выборки из среза (line integral).
-    
-    // Вращенные координаты
-    // t - вдоль детектора, p - перпендикулярно детектору
-    // Нам нужен луч, где t = bin_idx - detector_center
     float t = (float)bin_idx - detector_center;
     
-    // Проходим вдоль луча p
     float ray_step = 1.0f; 
     float p_min = -max(width, height) * 0.75f;
     float p_max = max(width, height) * 0.75f;
     
     for (float p = p_min; p <= p_max; p += ray_step) {
-        // (t, p) -> (xx, yy)
         float xx = t * c - p * s;
-        float yy = -t * s - p * c; // Ускоренный расчет с обратной матрицей
+        float yy = -t * s - p * c;
 
         float x = xx + cx;
         float y = yy + cy;
 
-        // Билинейная интерполяция
         int ix = (int)floorf(x);
         int iy = (int)floorf(y);
 
@@ -107,18 +140,14 @@ __global__ void multiplyFilterKernel(
     int pad_size,
     int num_angles) 
 {
-    // Всего элементов = (pad_size / 2 + 1) * num_angles
     int num_elements = (pad_size / 2 + 1);
     
-    int elem_x = blockIdx.x * blockDim.x + threadIdx.x; // index in pad_size/2+1
+    int elem_x = blockIdx.x * blockDim.x + threadIdx.x; 
     int angle_idx = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (elem_x >= num_elements || angle_idx >= num_angles) return;
 
     int idx = angle_idx * num_elements + elem_x;
-    
-    // filter[] is symmetric, size is pad_size
-    // for cufft R2C, frequency bins are 0 to pad_size/2
     float f = filter[elem_x]; 
     
     spectrum[idx].x *= f;
@@ -153,9 +182,6 @@ __global__ void backprojectionTextureKernel(
     for (int a = 0; a < num_angles; ++a) {
         float t = xx * cos_table[a] - yy * sin_table[a];
         float u = t + detector_center;
-        
-        // В Texture Object интерполяция нормализована или ненормализована в зависимости от настроек.
-        // Используем ненормализованные координаты: +0.5f для центра пикселя
         sum += tex2D<float>(tex, (float)a + 0.5f, u + 0.5f);
     }
 
@@ -193,6 +219,63 @@ struct ThresholdPredicate {
 
 } // anonymous namespace
 
+CUDABackend::~CUDABackend() {
+    releaseCache();
+}
+
+void CUDABackend::releaseCache() const {
+    if (m_d_filter) { cudaFree(m_d_filter); m_d_filter = nullptr; }
+    if (m_d_cos) { cudaFree(m_d_cos); m_d_cos = nullptr; }
+    if (m_d_sin) { cudaFree(m_d_sin); m_d_sin = nullptr; }
+    if (m_planR2C) { cufftDestroy(m_planR2C); m_planR2C = 0; }
+    if (m_planC2R) { cufftDestroy(m_planC2R); m_planC2R = 0; }
+    m_filterSize = 0;
+    m_planAngles = 0;
+    m_trigAngles = 0;
+}
+
+void CUDABackend::ensureFilter(size_t padded_size, ReconstructionParams::FilterType type) const {
+    if (m_filterSize == padded_size && m_filterType == type) return;
+    std::vector<float> cpu_filter = FilterDesign::createFilter(padded_size, type);
+    if (m_d_filter) cudaFree(m_d_filter);
+    CUDA_CHECK(cudaMalloc(&m_d_filter, padded_size * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(m_d_filter, cpu_filter.data(), padded_size * sizeof(float), cudaMemcpyHostToDevice));
+    m_filterSize = padded_size;
+    m_filterType = type;
+}
+
+void CUDABackend::ensurePlans(size_t num_angles, size_t padded_size) const {
+    if (m_planAngles == num_angles && m_planPadded == padded_size) return;
+    if (m_planR2C) cufftDestroy(m_planR2C);
+    if (m_planC2R) cufftDestroy(m_planC2R);
+    int n[1] = { (int)padded_size };
+    cufftPlanMany(&m_planR2C, 1, n, NULL, 1, padded_size, NULL, 1, padded_size, CUFFT_R2C, (int)num_angles);
+    cufftPlanMany(&m_planC2R, 1, n, NULL, 1, padded_size, NULL, 1, padded_size, CUFFT_C2R, (int)num_angles);
+    m_planAngles = num_angles;
+    m_planPadded = padded_size;
+}
+
+void CUDABackend::ensureTrigTables(const std::vector<float>& angles_deg) const {
+    if (m_cachedAnglesDeg == angles_deg) return;
+    size_t n = angles_deg.size();
+    std::vector<float> hcos(n), hsin(n);
+    for (size_t a = 0; a < n; ++a) {
+        float th = angles_deg[a] * (float)(M_PI / 180.0);
+        hcos[a] = std::cos(th);
+        hsin[a] = std::sin(th);
+    }
+    if (m_trigAngles != n) {
+        if (m_d_cos) cudaFree(m_d_cos);
+        if (m_d_sin) cudaFree(m_d_sin);
+        CUDA_CHECK(cudaMalloc(&m_d_cos, n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&m_d_sin, n * sizeof(float)));
+    }
+    CUDA_CHECK(cudaMemcpy(m_d_cos, hcos.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(m_d_sin, hsin.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    m_trigAngles = n;
+    m_cachedAnglesDeg = angles_deg;
+}
+
 bool CUDABackend::isAvailable() const {
     int count = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
@@ -226,18 +309,31 @@ Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, 
     CUDA_CHECK(cudaMalloc(&d_sino, num_angles * detector_bins * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_angles, num_angles * sizeof(float)));
 
+    // Копирование сырого среза
     CUDA_CHECK(cudaMemcpy(d_slice, slice.data.data(), w * h * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_angles, sino.angles_deg.data(), num_angles * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_sino, 0, num_angles * detector_bins * sizeof(float)));
 
+    // Нормализация на GPU
+    thrust::device_ptr<float> dp(d_slice);
+    float vmin = *thrust::min_element(dp, dp + (w * h));
+    float vmax = *thrust::max_element(dp, dp + (w * h));
+
+    sino.original_min_hu = vmin;
+    sino.original_max_hu = vmax;
+
+    float span = vmax - vmin;
+    if (span < 1e-6f) span = 1.0f;
+    float inv_span = 1.0f / span;
+    int grid_norm = (int)((w * h + 255) / 256);
+    normalizeGPUKernel<<<grid_norm, 256>>>(d_slice, w * h, vmin, inv_span);
+
+    // Прямое проецирование
     dim3 block(16, 16);
     dim3 grid((num_angles + block.x - 1) / block.x, (detector_bins + block.y - 1) / block.y);
 
     radonForwardKernel<<<grid, block>>>(d_slice, d_sino, d_angles, w, h, num_angles, detector_bins, cx, cy, detector_center);
-    // cudaDeviceSynchronize не нужен здесь — cudaMemcpy DeviceToHost сам является барьером
 
-    // Скопировать обратно (заметьте, что sino.data плоская, num_angles * detector_bins)
-    // Но в Buffer2D у нас width = num_angles. Kernel писал d_sino[bin_idx * num_angles + angle_idx]. Это совпадает.
     CUDA_CHECK(cudaMemcpy(sino.data.data.data(), d_sino, num_angles * detector_bins * sizeof(float), cudaMemcpyDeviceToHost));
 
     cudaFree(d_slice);
@@ -255,74 +351,67 @@ Buffer2D CUDABackend::reconstructSlice(const Sinogram& sinogram, size_t output_s
     const size_t detector_bins = sinogram.data.height;
 
     const size_t square_bins = static_cast<size_t>(std::ceil(std::sqrt(2.0) * static_cast<double>(detector_bins)));
-    const size_t pad = square_bins - detector_bins;
     const size_t pad_before = (square_bins / 2) - (detector_bins / 2);
-
     const size_t padding_factor = 8;
     const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
 
-    // Подготовка фильтра на CPU и перенос на GPU
-    std::vector<float> cpu_filter = FilterDesign::createFilter(projection_size_padded, params.filter);
-    float* d_filter = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_filter, projection_size_padded * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_filter, cpu_filter.data(), projection_size_padded * sizeof(float), cudaMemcpyHostToDevice));
+    ensureFilter(projection_size_padded, params.filter);
+    ensurePlans(num_angles, projection_size_padded);
+    ensureTrigTables(sinogram.angles_deg);
 
     // Копирование Sino
+    float* d_sino_src = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_sino_src, num_angles * detector_bins * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_sino_src, sinogram.data.data.data(), num_angles * detector_bins * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Padding Sino na GPU
     float* d_sino_padded = nullptr;
     CUDA_CHECK(cudaMalloc(&d_sino_padded, num_angles * projection_size_padded * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_sino_padded, 0, num_angles * projection_size_padded * sizeof(float)));
 
-    // Мы должны копировать строку за строкой. 
-    // Вместо сложного кернела здесь, сделаем на CPU и скопируем.
-    std::vector<float> cpu_sino_padded(num_angles * projection_size_padded, 0.0f);
-    for (size_t a = 0; a < num_angles; ++a) {
-        for (size_t b = 0; b < detector_bins; ++b) {
-            cpu_sino_padded[a * projection_size_padded + (b + pad_before)] = sinogram.data[b][a];
-        }
+    {
+        dim3 blk(16, 16);
+        dim3 grd((num_angles + 15) / 16, (detector_bins + 15) / 16);
+        packSinogramKernel<<<grd, blk>>>(
+            d_sino_src, d_sino_padded,
+            (int)num_angles, (int)detector_bins,
+            (int)projection_size_padded, (int)pad_before);
     }
-    CUDA_CHECK(cudaMemcpy(d_sino_padded, cpu_sino_padded.data(), cpu_sino_padded.size() * sizeof(float), cudaMemcpyHostToDevice));
-
-    // cuFFT 1D Batched (R2C и C2R)
-    cufftHandle planR2C, planC2R;
-    int n[1] = { (int)projection_size_padded };
-    cufftPlanMany(&planR2C, 1, n, NULL, 1, projection_size_padded, NULL, 1, projection_size_padded, CUFFT_R2C, num_angles);
-    cufftPlanMany(&planC2R, 1, n, NULL, 1, projection_size_padded, NULL, 1, projection_size_padded, CUFFT_C2R, num_angles);
+    cudaFree(d_sino_src);
 
     int complex_size = projection_size_padded / 2 + 1;
     cufftComplex* d_spectrum = nullptr;
     CUDA_CHECK(cudaMalloc(&d_spectrum, num_angles * complex_size * sizeof(cufftComplex)));
 
-    // Forward FFT
-    cufftExecR2C(planR2C, (cufftReal*)d_sino_padded, d_spectrum);
+    cufftExecR2C(m_planR2C, (cufftReal*)d_sino_padded, d_spectrum);
 
-    // Apply Filter
-    dim3 block(256, 1);
-    dim3 grid((complex_size + block.x - 1) / block.x, num_angles);
-    multiplyFilterKernel<<<grid, block>>>(d_spectrum, d_filter, projection_size_padded, num_angles);
-    // cudaDeviceSynchronize не нужен — cufftExecC2R автоматически ждёт завершения GPU-операций в потоке
-
-    // Inverse FFT
-    cufftExecC2R(planC2R, d_spectrum, (cufftReal*)d_sino_padded);
-    
-    // Normalization for C2R in cuFFT
-    float inv_N = 1.0f / projection_size_padded;
-    // ... we don't necessarily have to scale here, backprojection output is arbitrary anyway, but let's do it...
-    // just applying scaling in CPU copy.
-
-    // Выделяем filtered_square для текстуры (размер num_angles * square_bins)
-    std::vector<float> cpu_filtered(num_angles * square_bins);
-    CUDA_CHECK(cudaMemcpy(cpu_sino_padded.data(), d_sino_padded, cpu_sino_padded.size() * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    for (size_t a = 0; a < num_angles; ++a) {
-        for (size_t b = 0; b < square_bins; ++b) {
-            cpu_filtered[b * num_angles + a] = cpu_sino_padded[a * projection_size_padded + b] * inv_N;
-        }
+    {
+        dim3 blk(256, 1);
+        dim3 grd((complex_size + 255) / 256, (int)num_angles);
+        multiplyFilterKernel<<<grd, blk>>>(d_spectrum, m_d_filter, (int)projection_size_padded, (int)num_angles);
     }
 
-    // Создаем `cudaTextureObject_t` для `cpu_filtered` (размер width=num_angles, height=square_bins)
-    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
+    cufftExecC2R(m_planC2R, d_spectrum, (cufftReal*)d_sino_padded);
+    cudaFree(d_spectrum);
+
+    // Transpose and scale
+    float* d_filtered = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_filtered, square_bins * num_angles * sizeof(float)));
+    {
+        float scale = 1.0f / (float)projection_size_padded;
+        dim3 blk(32, 32);
+        dim3 grd(((int)num_angles + 31) / 32, ((int)square_bins + 31) / 32);
+        transposeScaleKernel<<<grd, blk>>>(d_sino_padded, d_filtered, (int)num_angles, (int)projection_size_padded, (int)square_bins, scale);
+    }
+    cudaFree(d_sino_padded);
+
+    std::vector<float> cpu_filtered(square_bins * num_angles);
+    CUDA_CHECK(cudaMemcpy(cpu_filtered.data(), d_filtered, cpu_filtered.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaFree(d_filtered);
+
+    cudaChannelFormatDesc chDesc = cudaCreateChannelDesc<float>();
     cudaArray_t cuArray;
-    CUDA_CHECK(cudaMallocArray(&cuArray, &channelDesc, num_angles, square_bins));
+    CUDA_CHECK(cudaMallocArray(&cuArray, &chDesc, num_angles, square_bins));
     CUDA_CHECK(cudaMemcpy2DToArray(cuArray, 0, 0, cpu_filtered.data(), num_angles * sizeof(float), num_angles * sizeof(float), square_bins, cudaMemcpyHostToDevice));
 
     cudaResourceDesc resDesc = {};
@@ -334,54 +423,40 @@ Buffer2D CUDABackend::reconstructSlice(const Sinogram& sinogram, size_t output_s
     texDesc.addressMode[1] = cudaAddressModeClamp;
     texDesc.filterMode = cudaFilterModeLinear;
     texDesc.readMode = cudaReadModeElementType;
-    texDesc.normalizedCoords = 0; // Используем пиксельные координаты
+    texDesc.normalizedCoords = 0;
 
     cudaTextureObject_t texObj = 0;
     CUDA_CHECK(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL));
 
-    // Backprojection
     float* d_recon = nullptr;
     CUDA_CHECK(cudaMalloc(&d_recon, output_size * output_size * sizeof(float)));
 
-    std::vector<float> cos_table(num_angles);
-    std::vector<float> sin_table(num_angles);
-    for (size_t a = 0; a < num_angles; ++a) {
-        float th = sinogram.angles_deg[a] * (M_PI / 180.0f);
-        cos_table[a] = std::cos(th);
-        sin_table[a] = std::sin(th);
+    {
+        dim3 bp_block(16, 16);
+        dim3 bp_grid((output_size + bp_block.x - 1) / bp_block.x, (output_size + bp_block.y - 1) / bp_block.y);
+
+        backprojectionTextureKernel<<<bp_grid, bp_block>>>(
+            texObj, d_recon, m_d_cos, m_d_sin, 
+            (int)output_size, (int)num_angles, (int)detector_bins, 
+            (float)output_size / 2.0f, (float)square_bins / 2.0f
+        );
     }
 
-    float* d_cos = nullptr;
-    float* d_sin = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_cos, num_angles * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_sin, num_angles * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_cos, cos_table.data(), num_angles * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_sin, sin_table.data(), num_angles * sizeof(float), cudaMemcpyHostToDevice));
+    // Денормализация на GPU
+    float span = sinogram.original_max_hu - sinogram.original_min_hu;
+    if (span > 0.0f) {
+        int grid_denorm = (output_size * output_size + 255) / 256;
+        denormalizeGPUKernel<<<grid_denorm, 256>>>(d_recon, output_size * output_size, sinogram.original_min_hu, span);
+    }
 
-    dim3 bp_block(16, 16);
-    dim3 bp_grid((output_size + bp_block.x - 1) / bp_block.x, (output_size + bp_block.y - 1) / bp_block.y);
-
-    backprojectionTextureKernel<<<bp_grid, bp_block>>>(
-        texObj, d_recon, d_cos, d_sin, 
-        output_size, num_angles, detector_bins, 
-        (float)output_size / 2.0f, (float)square_bins / 2.0f
-    );
     CUDA_CHECK(cudaDeviceSynchronize());
 
     recon.assign(output_size, output_size, 0.0f);
     CUDA_CHECK(cudaMemcpy(recon.data.data(), d_recon, output_size * output_size * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // Clean up
     CUDA_CHECK(cudaDestroyTextureObject(texObj));
     CUDA_CHECK(cudaFreeArray(cuArray));
     cudaFree(d_recon);
-    cudaFree(d_cos);
-    cudaFree(d_sin);
-    cudaFree(d_filter);
-    cudaFree(d_sino_padded);
-    cudaFree(d_spectrum);
-    cufftDestroy(planR2C);
-    cufftDestroy(planC2R);
 
     return recon;
 }
@@ -392,8 +467,6 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
                                       std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) {
     if (input_volume.empty()) return;
     
-    // В CUDA бэкенде мы можем итерировать по срезам как на CPU для простоты,
-    // либо сделать пакетную обработку. Для начала оставим итерацию + отправку каждого среза.
     const size_t depth = input_volume.depth;
     const size_t width = input_volume.width;
     const size_t height = input_volume.height;
@@ -421,7 +494,6 @@ PointCloud CUDABackend::extractPointCloud(const Volume& vol, float threshold) {
 
     const size_t N = vol.data.size();
     
-    // Перенос данных на устройство
     thrust::device_vector<float> d_vol_data = vol.data;
     thrust::device_vector<float> d_x_coords = vol.x_coords;
     thrust::device_vector<float> d_y_coords = vol.y_coords;

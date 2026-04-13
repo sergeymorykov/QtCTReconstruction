@@ -252,11 +252,13 @@ QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bo
 
     float min_v = slice.empty() ? 0.0f : slice[0][0];
     float max_v = min_v;
-    for (const auto& row : slice) {
-        for (size_t x = 0; x < slice.width; ++x) {
-            const float v = row[x];
-            min_v = std::min(min_v, v);
-            max_v = std::max(max_v, v);
+    
+    #pragma omp parallel for reduction(min:min_v) reduction(max:max_v)
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float v = slice[y][x];
+            if (v < min_v) min_v = v;
+            if (v > max_v) max_v = v;
         }
     }
     if (std::abs(max_v - min_v) < 1e-6f) {
@@ -264,8 +266,13 @@ QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bo
     }
 
     const float span = max_v - min_v;
+    const float inv_span = 1.0f / span;
+    const int bytes_per_line = img.bytesPerLine();
+    uchar* bits = img.bits();
+
+    #pragma omp parallel for
     for (int y = 0; y < height; ++y) {
-        uchar* scanLine = img.scanLine(y);
+        uchar* scanLine = bits + y * bytes_per_line;
         for (int x = 0; x < width; ++x) {
             const float v = slice[static_cast<size_t>(height - 1 - y)][static_cast<size_t>(x)];
 
@@ -275,7 +282,7 @@ QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bo
                 n = ct::utils::clamp(std::abs(v) / 50.0f, 0.0f, 1.0f);
             } else {
                 // Обычная нормализация для остальных типов изображений
-                n = ct::utils::clamp((v - min_v) / span, 0.0f, 1.0f);
+                n = ct::utils::clamp((v - min_v) * inv_span, 0.0f, 1.0f);
             }
 
             const int c = static_cast<int>(n * 255.0f);
@@ -287,7 +294,6 @@ QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bo
             }
         }
     }
-
 
     return img;
 }
@@ -305,24 +311,32 @@ QImage CtReconstructionController::sinogramToImage(const ct::Sinogram& sinogram)
 
     float min_v = sinogram.data[0][0];
     float max_v = sinogram.data[0][0];
-    for (const auto& row : sinogram.data) {
-        for (size_t x = 0; x < sinogram.data.width; ++x) {
-            const float v = row[x];
-            min_v = std::min(min_v, v);
-            max_v = std::max(max_v, v);
+    
+    #pragma omp parallel for reduction(min:min_v) reduction(max:max_v)
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float v = sinogram.data[y][x];
+            if (v < min_v) min_v = v;
+            if (v > max_v) max_v = v;
         }
     }
+    
     if (std::abs(max_v - min_v) < 1e-6f) {
         max_v = min_v + 1.0f;
     }
+    
+    const float inv_span = 1.0f / (max_v - min_v);
+    const int bytes_per_line = img.bytesPerLine();
+    uchar* bits = img.bits();
 
+    #pragma omp parallel for
     for (int y = 0; y < height; ++y) {
-        auto* rowPtr = reinterpret_cast<QRgb*>(img.scanLine(y));
+        uchar* rowPtr = bits + y * bytes_per_line;
         for (int x = 0; x < width; ++x) {
             const float v = sinogram.data[static_cast<size_t>(height - 1 - y)][static_cast<size_t>(x)];
-            const float n = ct::utils::clamp((v - min_v) / (max_v - min_v), 0.0f, 1.0f);
+            const float n = ct::utils::clamp((v - min_v) * inv_span, 0.0f, 1.0f);
             const int c = static_cast<int>(n * 255.0f);
-            rowPtr[x] = qRgb(c, c, c);
+            reinterpret_cast<QRgb*>(rowPtr)[x] = qRgb(c, c, c);
         }
     }
 
@@ -550,36 +564,7 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     ct::Slice diff_mid;
 
     // ---------------------------------------------------------------
-    // Вспомогательная лямбда нормализации HU → [0, 1]
-    // ---------------------------------------------------------------
-    auto normalizeSlice = [](const ct::Slice& src, ct::Slice& out,
-                             float& hu_min_out, float& hu_max_out) {
-        float hu_min = std::numeric_limits<float>::max();
-        float hu_max = std::numeric_limits<float>::lowest();
-        for (const auto& row : src) {
-            for (size_t x = 0; x < src.width; ++x) {
-                const float v = row[x];
-                hu_min = std::min(hu_min, v);
-                hu_max = std::max(hu_max, v);
-            }
-        }
-        hu_min_out = hu_min;
-        hu_max_out = hu_max;
-        out.assign(src.width, src.height, 0.0f);
-        if (hu_max > hu_min) {
-            const float inv_span = 1.0f / (hu_max - hu_min);
-            for (size_t y = 0; y < src.height; ++y) {
-                for (size_t x = 0; x < src.width; ++x) {
-                    out[y][x] = (src[y][x] - hu_min) * inv_span;
-                }
-            }
-        }
-    };
-
-    // ---------------------------------------------------------------
-    // ЕДИНЫЙ цикл: нормализация → синограмма → реконструкция.
-    // Ранее было два отдельных прохода, что означало двойное вычисление
-    // синограммы для каждого среза (×2 нагрузка на CPU и GPU).
+    // ЕДИНЫЙ цикл: нормализация -> синограмма -> реконструкция.
     // ---------------------------------------------------------------
     const auto t_total_start = std::chrono::steady_clock::now();
 
@@ -591,14 +576,9 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
         const size_t zi = static_cast<size_t>(z);
         const ct::Slice& original = volume.getSlice(zi);
 
-        // 1. Нормализация HU → [0, 1]
-        float hu_min = 0.0f, hu_max = 0.0f;
-        ct::Slice normalized;
-        normalizeSlice(original, normalized, hu_min, hu_max);
-
-        // 2. Синограмма (один раз на срез!)
+        // 1. Синограмма (уже делает нормализацию внутри бэкенда)
         const size_t detector_bins = original.height;
-        ct::Sinogram sinogram = backendImpl->computeSinogram(normalized, params.num_angles, detector_bins);
+        ct::Sinogram sinogram = backendImpl->computeSinogram(original, params.num_angles, detector_bins);
         (*results.sinogramImages)[zi] = sinogramToImage(sinogram);
 
         if (z == mid_z) {
@@ -607,19 +587,8 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
             qDebug() << "[CT] computeAll: sinogram stage (mid) done, seconds=" << results.sinogramTimeSec;
         }
 
-        // 3. Реконструкция из уже готовой синограммы
-        ct::Slice recon_normalized = backendImpl->reconstructSlice(sinogram, original.width, params);
-
-        // 4. Денормализация → HU
-        ct::Slice reconstruction(original.width, original.height, hu_min);
-        if (hu_max > hu_min) {
-            const float span = hu_max - hu_min;
-            for (size_t y = 0; y < reconstruction.height; ++y) {
-                for (size_t x = 0; x < reconstruction.width; ++x) {
-                    reconstruction[y][x] = recon_normalized[y][x] * span + hu_min;
-                }
-            }
-        }
+        // 2. Реконструкция из уже готовой синограммы (и денормализация внутри бэкенда)
+        ct::Slice reconstruction = backendImpl->reconstructSlice(sinogram, original.width, params);
 
         ct::Slice differences = ct::utils::subtract(reconstruction, original);
         (*results.originalImages)[zi]       = sliceToImage(original, false);

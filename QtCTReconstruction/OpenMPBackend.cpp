@@ -3,14 +3,68 @@
 #include "FilteredBackprojection.h"
 #include "RadonTransform.h"
 
+#include <algorithm>
+#include <limits>
+#include <omp.h>
+
 namespace ct {
 
 Sinogram OpenMPBackend::computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins) {
-    return RadonTransform::forward(slice, num_angles, detector_bins);
+    if (slice.empty() || num_angles == 0 || detector_bins == 0) return {};
+
+    float hu_min = std::numeric_limits<float>::max();
+    float hu_max = std::numeric_limits<float>::lowest();
+
+    #pragma omp parallel for reduction(min:hu_min) reduction(max:hu_max)
+    for (int y = 0; y < static_cast<int>(slice.height); ++y) {
+        for (size_t x = 0; x < slice.width; ++x) {
+            float v = slice.data[y * slice.width + x];
+            if (v < hu_min) hu_min = v;
+            if (v > hu_max) hu_max = v;
+        }
+    }
+
+    Buffer2D normalized(slice.width, slice.height, 0.0f);
+    float span = hu_max - hu_min;
+    if (span < 1e-6f) span = 1.0f;
+    float inv_span = 1.0f / span;
+
+    #pragma omp parallel for
+    for (int y = 0; y < static_cast<int>(slice.height); ++y) {
+        for (size_t x = 0; x < slice.width; ++x) {
+            normalized.data[y * slice.width + x] = (slice.data[y * slice.width + x] - hu_min) * inv_span;
+        }
+    }
+
+    Sinogram sino = RadonTransform::forward(normalized, num_angles, detector_bins);
+    sino.original_min_hu = hu_min;
+    sino.original_max_hu = hu_max;
+
+    return sino;
 }
 
 Buffer2D OpenMPBackend::reconstructSlice(const Sinogram& sinogram, size_t output_size, const ReconstructionParams& params) {
-    return FilteredBackprojection::reconstruct(sinogram, output_size, params);
+    Buffer2D recon_normalized = FilteredBackprojection::reconstruct(sinogram, output_size, params);
+    
+    if (recon_normalized.empty()) return recon_normalized;
+
+    Buffer2D recon_hu(recon_normalized.width, recon_normalized.height, 0.0f);
+    float span = sinogram.original_max_hu - sinogram.original_min_hu;
+    float hu_min = sinogram.original_min_hu;
+
+    if (span <= 0.0f) {
+        recon_hu.assign(recon_normalized.width, recon_normalized.height, hu_min);
+        return recon_hu;
+    }
+
+    #pragma omp parallel for
+    for (int y = 0; y < static_cast<int>(recon_normalized.height); ++y) {
+        for (size_t x = 0; x < recon_normalized.width; ++x) {
+            recon_hu.data[y * recon_normalized.width + x] = recon_normalized.data[y * recon_normalized.width + x] * span + hu_min;
+        }
+    }
+
+    return recon_hu;
 }
 
 void OpenMPBackend::reconstructVolume(const Volume& input_volume, 
@@ -30,12 +84,6 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
 
     for (size_t z = 0; z < depth; ++z) {
         Buffer2D original_slice = input_volume.getSlice(z);
-        // Normalize for Radon Transform mapping
-        // Logic will need to match Controller if we handle min/max globally or locally
-        // ... well actually controller handles min/max scaling before passing?
-        // OpenMP backend itself just processes directly. The controller might do scaling.
-        // I'll keep the backend strictly mathematical.
-        
         Sinogram sino = computeSinogram(original_slice, params.num_angles, width);
         Buffer2D recon = reconstructSlice(sino, width, params);
         
