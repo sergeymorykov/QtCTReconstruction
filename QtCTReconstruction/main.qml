@@ -203,7 +203,7 @@ Window {
                 title: "Original"
                 accentColor: "#64b5f6"
                 source: controller.ready ? ("image://ct/original/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                xMin: -128; xMax: 128; yMin: -128; yMax: 128
+                xMin: -256; xMax: 256; yMin: -256; yMax: 256
                 xLabel: "X [px]"; yLabel: "Y [px]"
                 onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 0 }); }
             }
@@ -215,7 +215,7 @@ Window {
                 title: "Sinogram"
                 accentColor: "#81c784"
                 source: controller.ready ? ("image://ct/sinogram/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                xMin: 0; xMax: 180; yMin: -128; yMax: 128
+                xMin: 0; xMax: 180; yMin: -256; yMax: 256
                 xLabel: "Angle [deg]"; yLabel: "Detector Pos [px]"
                 stretchX: true
                 onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 1 }); }
@@ -228,7 +228,7 @@ Window {
                 title: "Reconstruction"
                 accentColor: "#ffb74d"
                 source: controller.ready ? ("image://ct/reconstruction/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                xMin: -128; xMax: 128; yMin: -128; yMax: 128
+                xMin: -256; xMax: 256; yMin: -256; yMax: 256
                 xLabel: "X [px]"; yLabel: "Y [px]"
                 onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 2 }); }
             }
@@ -240,7 +240,7 @@ Window {
                 title: "Difference"
                 accentColor: "#aaaaaa"
                 source: controller.ready ? ("image://ct/difference/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                xMin: -128; xMax: 128; yMin: -128; yMax: 128
+                xMin: -256; xMax: 256; yMin: -256; yMax: 256
                 xLabel: "X [px]"; yLabel: "Y [px]"
                 showColorScale: true
                 onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 3 }); }
@@ -360,10 +360,10 @@ Window {
                     return "";
                 }
                 
-                xMin: (instancedWindow.popupImageIndex === 1) ? 0 : -128
-                xMax: (instancedWindow.popupImageIndex === 1) ? 180 : 128
-                yMin: -128
-                yMax: 128
+                xMin: (instancedWindow.popupImageIndex === 1) ? 0 : -256
+                xMax: (instancedWindow.popupImageIndex === 1) ? 180 : 256
+                yMin: -256
+                yMax: 256
                 
                 xLabel: (instancedWindow.popupImageIndex === 1) ? "Angle [deg]" : "X [px]"
                 yLabel: (instancedWindow.popupImageIndex === 1) ? "Detector Pos [px]" : "Y [px]"

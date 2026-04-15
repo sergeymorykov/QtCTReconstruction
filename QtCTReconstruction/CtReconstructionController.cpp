@@ -426,7 +426,7 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::gen
     } else {
         const auto t_gen_start = std::chrono::steady_clock::now();
         ct::Generator3D::Params gen_params;
-        gen_params.shape = {256, 256, 256}; // Reduced slightly for faster feedback
+        gen_params.shape = {512, 512, 512}; // Increased to 512^3 as requested
         gen_params.num_ellipsoids = 200;
         
         ct::Generator3D generator;
@@ -499,6 +499,12 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     if (!ct::FileIO::loadVolumeNPY(inputNpyA, volume, false)) {
         qDebug() << "[CT] computeAll: failed to load volume";
         return results;
+    }
+
+    // Сохраняем текущее время генерации, чтобы не затереть его нулем в applyResult
+    {
+        QMutexLocker lock(&m_mutex);
+        results.genTimeSec = m_genTimeSec;
     }
 
     const int depth = static_cast<int>(volume.depth);
@@ -588,8 +594,8 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     cudaEventElapsedTime(&gpu_compute_ms, start, stop);
 
     const auto t_recon_done = std::chrono::steady_clock::now();
-    results.sinogramTimeSec = 0.0; 
-    results.reconTimeSec = std::chrono::duration<double>(t_recon_done - t_total_start).count();
+    results.sinogramTimeSec = backendImpl->lastSinogramTimeMs() / 1000.0; 
+    results.reconTimeSec = std::chrono::duration<double>(t_recon_done - t_total_start).count() - results.sinogramTimeSec;
     
     qDebug() << "[CT] computeAll: batch recon done.";
     qDebug() << "[BENCH] GPU Compute Only:" << gpu_compute_ms << "ms";
@@ -692,7 +698,9 @@ void CtReconstructionController::applyResult(const ReconstructionResult& result)
         m_hasVolume   = result.hasVolume;
         m_maxZ        = result.maxZ;
         m_currentZ    = result.currentZ;
-        m_genTimeSec       = result.genTimeSec;
+        if (result.genTimeSec > 0) {
+            m_genTimeSec = result.genTimeSec;
+        }
         m_sinogramTimeSec  = result.sinogramTimeSec;
         m_reconTimeSec     = result.reconTimeSec;
         m_originalImagesPtr        = result.originalImages;

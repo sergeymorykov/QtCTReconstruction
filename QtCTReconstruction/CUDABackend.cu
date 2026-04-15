@@ -337,6 +337,7 @@ bool CUDABackend::isAvailable() const {
 }
 
 Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Sinogram sino;
     if (slice.empty() || num_angles == 0 || detector_bins == 0) return sino;
 
@@ -384,11 +385,25 @@ Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, 
     // Очищаем буфер синограммы перед накоплением atomicAdd
     CUDA_CHECK(cudaMemset(m_d_sino, 0, num_angles * detector_bins * sizeof(float)));
 
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
     radonForwardScatterKernel<<<grid, block>>>(
         m_d_vol_in, m_d_sino, (int)w, (int)h, 
         (int)num_angles, (int)detector_bins, 
         cx, cy, detector_center, 0
     );
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    m_lastSinogramTimeMs = static_cast<double>(ms);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     CUDA_CHECK(cudaMemcpy(sino.data.data.data(), m_d_sino, num_angles * detector_bins * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -396,6 +411,7 @@ Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, 
 }
 
 Buffer2D CUDABackend::reconstructSlice(const Sinogram& sinogram, size_t output_size, const ReconstructionParams& params) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Buffer2D recon;
     if (sinogram.data.empty() || output_size == 0) return recon;
 
@@ -500,6 +516,7 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
                                       Volume& out_reconstruction,
                                       const ReconstructionParams& params,
                                       std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (input_volume.empty()) return;
     
     const size_t depth = input_volume.depth;
@@ -527,6 +544,11 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
 
     std::vector<float> slice_min(depth, 0.0f);
     std::vector<float> slice_max(depth, 0.0f);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
 
     // 3. Цикл по срезам внутри GPU (будет использовать Workspaces)
     for (size_t z = 0; z < depth; ++z) {
@@ -565,8 +587,17 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
         );
     }
 
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    m_lastSinogramTimeMs = static_cast<double>(ms);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
     // 4. Batch Reconstruction (FFT и Backprojection)
-    // Для краткости вызываем существующий reconstructSlice, но он теперь использует Device-Device копии.
+    //Для краткости вызываем существующий reconstructSlice, но он теперь использует Device-Device копии.
     // На реально больших данных здесь следовало бы делать Batch cuFFT.
     
     for (size_t z = 0; z < depth; ++z) {
@@ -587,6 +618,7 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
 }
 
 PointCloud CUDABackend::extractPointCloud(const Volume& vol, float threshold) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     PointCloud cloud;
     if (vol.empty()) return cloud;
 

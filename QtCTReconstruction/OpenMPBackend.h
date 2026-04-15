@@ -18,6 +18,10 @@ public:
                            std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) override;
 
     PointCloud extractPointCloud(const Volume& vol, float threshold) override;
+    double lastSinogramTimeMs() const override { return m_lastSinogramTimeMs; }
+
+private:
+    double m_lastSinogramTimeMs = 0.0;
 };
 
 } // namespace ct

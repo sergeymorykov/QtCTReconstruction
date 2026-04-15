@@ -2,6 +2,7 @@
 
 #include "IReconstructionBackend.h"
 #include <cufft.h>
+#include <mutex>
 
 namespace ct {
 
@@ -22,11 +23,15 @@ public:
                            std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) override;
 
     PointCloud extractPointCloud(const Volume& vol, float threshold) override;
+    double lastSinogramTimeMs() const override { return m_lastSinogramTimeMs; }
     
     // Пакетная очистка кэша
     void clearWorkspace() const;
 
 private:
+    mutable std::recursive_mutex m_mutex;
+    mutable double m_lastSinogramTimeMs = 0.0;
+
     // ---- Workspace: Буферы для целого объема (64MB за штуку для 256^3) ----
     mutable float* m_d_vol_in  = nullptr;
     mutable float* m_d_vol_out = nullptr;

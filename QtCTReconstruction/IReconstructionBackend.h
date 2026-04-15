@@ -32,6 +32,9 @@ public:
 
     // Извлечение облака точек по порогу HU
     virtual PointCloud extractPointCloud(const Volume& vol, float threshold) = 0;
+
+    // Время последнего этапа проецирования (мс)
+    virtual double lastSinogramTimeMs() const = 0;
 };
 
 // Простая фабрика для получения бэкендов

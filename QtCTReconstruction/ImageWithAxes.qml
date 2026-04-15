@@ -6,10 +6,10 @@ Item {
     id: root
     property string title: ""
     property var source: ""
-    property real xMin: -128
-    property real xMax: 128
-    property real yMin: -128
-    property real yMax: 128
+    property real xMin: -256
+    property real xMax: 256
+    property real yMin: -256
+    property real yMax: 256
     property string xLabel: "X"
     property string yLabel: "Y"
     property bool stretchX: false
