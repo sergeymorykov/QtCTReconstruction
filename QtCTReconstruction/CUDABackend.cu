@@ -377,24 +377,6 @@ Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, 
     int grid_norm = (int)((w * h + 255) / 256);
     normalizeGPUKernel<<<grid_norm, 256>>>(m_d_vol_in, w * h, vmin, inv_span);
 
-    // Создаем текстуру ПРЯМО из m_d_vol_in
-    cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
-    cudaArray_t array;
-    cudaMallocArray(&array, &desc, w, h);
-    cudaMemcpy2DToArray(array, 0, 0, m_d_vol_in, w * sizeof(float), w * sizeof(float), h, cudaMemcpyDeviceToDevice);
-    
-    cudaResourceDesc resDesc = {};
-    resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = array;
-    cudaTextureDesc texDesc = {};
-    texDesc.filterMode = cudaFilterModeLinear;
-    texDesc.addressMode[0] = cudaAddressModeClamp;
-    texDesc.addressMode[1] = cudaAddressModeClamp;
-    texDesc.readMode = cudaReadModeElementType;
-
-    cudaTextureObject_t texSlice;
-    cudaCreateTextureObject(&texSlice, &resDesc, &texDesc, nullptr);
-
     // 3. Прямое проецирование (Scatter алгоритм - идентично CPU)
     dim3 block(16, 16);
     dim3 grid((w + 15) / 16, (h + 15) / 16);
@@ -409,9 +391,6 @@ Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, 
     );
 
     CUDA_CHECK(cudaMemcpy(sino.data.data.data(), m_d_sino, num_angles * detector_bins * sizeof(float), cudaMemcpyDeviceToHost));
-
-    cudaDestroyTextureObject(texSlice);
-    cudaFreeArray(array);
 
     return sino;
 }
@@ -546,28 +525,26 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
     // 2. Копируем ВЕСЬ объем на GPU один раз
     CUDA_CHECK(cudaMemcpy(m_d_vol_in, input_volume.data.data(), depth * width * height * sizeof(float), cudaMemcpyHostToDevice));
 
+    std::vector<float> slice_min(depth, 0.0f);
+    std::vector<float> slice_max(depth, 0.0f);
+
     // 3. Цикл по срезам внутри GPU (будет использовать Workspaces)
     for (size_t z = 0; z < depth; ++z) {
         // Мы можем оптимизировать это еще сильнее, запустив ядра на весь объем,
         // но для начала устраним malloc/free и лишние копии.
-        
-        // Для каждого среза создаем временную текстуру (это быстро)
-        cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
-        cudaArray_t array;
-        cudaMallocArray(&array, &desc, width, height);
-        cudaMemcpy2DToArray(array, 0, 0, m_d_vol_in + (z * width * height), width * sizeof(float), width * sizeof(float), height, cudaMemcpyDeviceToDevice);
-        
-        cudaResourceDesc resDesc = {};
-        resDesc.resType = cudaResourceTypeArray;
-        resDesc.res.array.array = array;
-        cudaTextureDesc texDesc = {};
-        texDesc.filterMode = cudaFilterModeLinear;
-        texDesc.addressMode[0] = cudaAddressModeClamp;
-        texDesc.addressMode[1] = cudaAddressModeClamp;
-        texDesc.readMode = cudaReadModeElementType;
 
-        cudaTextureObject_t texSlice;
-        cudaCreateTextureObject(&texSlice, &resDesc, &texDesc, nullptr);
+        thrust::device_ptr<float> dp(m_d_vol_in + (z * width * height));
+        float vmin = *thrust::min_element(dp, dp + (width * height));
+        float vmax = *thrust::max_element(dp, dp + (width * height));
+        
+        slice_min[z] = vmin;
+        slice_max[z] = vmax;
+
+        float span = vmax - vmin;
+        if (span < 1e-6f) span = 1.0f;
+        float inv_span = 1.0f / span;
+        int grid_norm = (int)((width * height + 255) / 256);
+        normalizeGPUKernel<<<grid_norm, 256>>>(m_d_vol_in + (z * width * height), width * height, vmin, inv_span);
 
         // Forward Projection (Scatter)
         dim3 block(16, 16);
@@ -586,9 +563,6 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
             (int)params.num_angles, (int)width, 
             cx, cy, detector_center, (int)z
         );
-
-        cudaDestroyTextureObject(texSlice);
-        cudaFreeArray(array);
     }
 
     // 4. Batch Reconstruction (FFT и Backprojection)
@@ -602,8 +576,8 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
         // В данном случае, чтобы не ломать логику IReconstructionBackend, копируем точечно.
         CUDA_CHECK(cudaMemcpy(s.data.data.data(), m_d_sino + (z * params.num_angles * width), params.num_angles * width * sizeof(float), cudaMemcpyDeviceToHost));
         s.angles_deg = angles;
-        s.original_min_hu = -1000.0f; // Упрощение для теста
-        s.original_max_hu = 1000.0f;
+        s.original_min_hu = slice_min[z];
+        s.original_max_hu = slice_max[z];
 
         Buffer2D recon = reconstructSlice(s, width, params);
         out_reconstruction.setSlice(z, recon);
