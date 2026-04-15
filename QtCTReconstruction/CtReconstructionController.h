@@ -26,6 +26,7 @@ class CtReconstructionController : public QObject {
     Q_PROPERTY(int filterType READ filterType WRITE setFilterType NOTIFY filterTypeChanged)
     Q_PROPERTY(int backendType READ backendType WRITE setBackendType NOTIFY backendTypeChanged)
     Q_PROPERTY(bool asBuffer READ asBuffer WRITE setAsBuffer NOTIFY asBufferChanged)
+    Q_PROPERTY(int volumeSize READ volumeSize WRITE setVolumeSize NOTIFY volumeSizeChanged)
     Q_PROPERTY(bool isDebugBuild READ isDebugBuild CONSTANT)
 
 public:
@@ -45,6 +46,7 @@ public:
     int filterType() const;
     int backendType() const;
     bool asBuffer() const;
+    int volumeSize() const;
     bool isDebugBuild() const;
 
     Q_INVOKABLE void generateVolume();
@@ -57,6 +59,7 @@ public:
     void setFilterType(int type);
     void setBackendType(int type);
     void setAsBuffer(bool buffer);
+    void setVolumeSize(int size);
 
     QImage imageOriginal(int z) const;
     QImage imageSinogram(int z) const;
@@ -73,6 +76,7 @@ signals:
     void filterTypeChanged();
     void backendTypeChanged();
     void asBufferChanged();
+    void volumeSizeChanged();
     void maxDifferenceChanged();
     void sliceUpdated(int index);
 
@@ -139,6 +143,7 @@ private:
     int m_filterType = 1; // SheppLogan
     int m_backendType = 0; // OpenCV/CUDA switch
     bool m_asBuffer = true;
+    int m_volumeSize = 1024;
 
     QPointer<QFutureWatcher<ReconstructionResult>> m_activeWatcher;
 

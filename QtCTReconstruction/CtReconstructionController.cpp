@@ -119,6 +119,7 @@ void CtReconstructionController::setCurrentZ(const int z) {
 int CtReconstructionController::filterType() const { QMutexLocker lock(&m_mutex); return m_filterType; }
 int CtReconstructionController::backendType() const { QMutexLocker lock(&m_mutex); return m_backendType; }
 bool CtReconstructionController::asBuffer() const { QMutexLocker lock(&m_mutex); return m_asBuffer; }
+int CtReconstructionController::volumeSize() const { QMutexLocker lock(&m_mutex); return m_volumeSize; }
 bool CtReconstructionController::isDebugBuild() const {
 #ifdef NDEBUG
     return false;
@@ -153,6 +154,24 @@ void CtReconstructionController::setAsBuffer(bool buffer) {
     }
     emit asBufferChanged();
 }
+
+void CtReconstructionController::setVolumeSize(int size) {
+    {
+        QMutexLocker lock(&m_mutex);
+        if (m_volumeSize == size) return;
+        m_volumeSize = size;
+        m_hasVolume = false;
+        m_ready = false;
+        if (m_originalImagesPtr) m_originalImagesPtr->clear();
+        if (m_sinogramImagesPtr) m_sinogramImagesPtr->clear();
+        if (m_reconstructionImagesPtr) m_reconstructionImagesPtr->clear();
+        if (m_differenceImagesPtr) m_differenceImagesPtr->clear();
+    }
+    emit volumeSizeChanged();
+    emit hasVolumeChanged();
+    emit readyChanged();
+}
+
 
 void CtReconstructionController::savePng(int z) {
     if (!m_ready) return;
@@ -193,7 +212,12 @@ void CtReconstructionController::extractAndFillPointCloud(QObject* geometry) {
         return;
     }
 
-    const QString inputNpy = QCoreApplication::applicationDirPath() + "/data/output/synthetic_brain_hu_cxx.npy";
+    int volSize;
+    {
+        QMutexLocker lock(&m_mutex);
+        volSize = m_volumeSize;
+    }
+    const QString inputNpy = QCoreApplication::applicationDirPath() + "/data/output/synthetic_brain_hu_cxx_" + QString::number(volSize) + ".npy";
     ct::Volume volume;
     if (!ct::FileIO::loadVolumeNPY(inputNpy.toStdString(), volume, false)) {
         qDebug() << "[CT] Failed to load volume for extraction";
@@ -417,13 +441,16 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::gen
     double genTime = 0.0;
     std::string outputDirA = outputDir.toStdString();
     std::replace(outputDirA.begin(), outputDirA.end(), '/', '\\');
-    const std::string inputNpyA = outputDirA + "\\synthetic_brain_hu_cxx.npy";
 
     int backendId;
+    int volSize;
     {
         QMutexLocker lock(&m_mutex);
         backendId = m_backendType;
+        volSize = m_volumeSize;
     }
+
+    const std::string inputNpyA = outputDirA + "\\synthetic_brain_hu_cxx_" + std::to_string(volSize) + ".npy";
 
     if (static_cast<bool>(std::ifstream(inputNpyA, std::ios::binary))) {
         result.hasVolume = true;
@@ -431,7 +458,7 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::gen
     } else {
         const auto t_gen_start = std::chrono::steady_clock::now();
         ct::Generator3D::Params gen_params;
-        gen_params.shape = {512, 512, 512}; // Increased to 512^3 as requested
+        gen_params.shape = {static_cast<size_t>(volSize), static_cast<size_t>(volSize), static_cast<size_t>(volSize)}; 
         gen_params.num_ellipsoids = 200;
         
         ct::Generator3D generator;
@@ -444,7 +471,7 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::gen
         }
 
         const ct::Volume volume = generator.generateBrainHU(gen_params);
-        const std::string outNpyA = outputDirA + "\\synthetic_brain_hu_cxx.npy";
+        const std::string outNpyA = outputDirA + "\\synthetic_brain_hu_cxx_" + std::to_string(volSize) + ".npy";
         ct::FileIO::saveVolumeNPY(volume, outNpyA);
         const auto t_gen_end = std::chrono::steady_clock::now();
         genTime = std::chrono::duration<double>(t_gen_end - t_gen_start).count();
@@ -494,7 +521,13 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     ReconstructionResult results;
     results.success = false;
 
-    const QString inputNpy    = QCoreApplication::applicationDirPath() + "/data/output/synthetic_brain_hu_cxx.npy";
+    int volSize;
+    {
+        QMutexLocker lock(&m_mutex);
+        volSize = m_volumeSize;
+    }
+
+    const QString inputNpy    = QCoreApplication::applicationDirPath() + "/data/output/synthetic_brain_hu_cxx_" + QString::number(volSize) + ".npy";
     const QString outputDirQ  = QCoreApplication::applicationDirPath() + "/data/output";
     const std::wstring outputDirW = toWStringBackslashPath(outputDirQ);
     const std::string inputNpyA  = inputNpy.toStdString();

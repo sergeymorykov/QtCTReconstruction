@@ -108,6 +108,19 @@ Window {
                 palette.buttonText: "white"
             }
 
+            Label { text: "Size:"; color: "white" }
+            ComboBox {
+                model: ["128", "256", "512", "1024"]
+                currentIndex: {
+                    if (controller.volumeSize === 1024) return 3;
+                    if (controller.volumeSize === 512) return 2;
+                    if (controller.volumeSize === 256) return 1;
+                    return 0; // 128
+                }
+                onCurrentIndexChanged: controller.volumeSize = parseInt(model[currentIndex], 10)
+                implicitWidth: 100
+            }
+
             Item { Layout.fillWidth: true }
 
             Button {
@@ -203,7 +216,7 @@ Window {
                 title: "Original"
                 accentColor: "#64b5f6"
                 source: controller.ready ? ("image://ct/original/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                xMin: -256; xMax: 256; yMin: -256; yMax: 256
+                xMin: -controller.volumeSize / 2; xMax: controller.volumeSize / 2; yMin: -controller.volumeSize / 2; yMax: controller.volumeSize / 2
                 xLabel: "X [px]"; yLabel: "Y [px]"
                 onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 0 }); }
             }
@@ -215,7 +228,7 @@ Window {
                 title: "Sinogram"
                 accentColor: "#81c784"
                 source: controller.ready ? ("image://ct/sinogram/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                xMin: 0; xMax: 180; yMin: -256; yMax: 256
+                xMin: 0; xMax: 180; yMin: -controller.volumeSize / 2; yMax: controller.volumeSize / 2
                 xLabel: "Angle [deg]"; yLabel: "Detector Pos [px]"
                 stretchX: true
                 onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 1 }); }
@@ -228,7 +241,7 @@ Window {
                 title: "Reconstruction"
                 accentColor: "#ffb74d"
                 source: controller.ready ? ("image://ct/reconstruction/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                xMin: -256; xMax: 256; yMin: -256; yMax: 256
+                xMin: -controller.volumeSize / 2; xMax: controller.volumeSize / 2; yMin: -controller.volumeSize / 2; yMax: controller.volumeSize / 2
                 xLabel: "X [px]"; yLabel: "Y [px]"
                 onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 2 }); }
             }
@@ -240,7 +253,7 @@ Window {
                 title: "Difference"
                 accentColor: "#aaaaaa"
                 source: controller.ready ? ("image://ct/difference/" + controller.currentZ + "?t=" + root.updateTicker) : ""
-                xMin: -256; xMax: 256; yMin: -256; yMax: 256
+                xMin: -controller.volumeSize / 2; xMax: controller.volumeSize / 2; yMin: -controller.volumeSize / 2; yMax: controller.volumeSize / 2
                 xLabel: "X [px]"; yLabel: "Y [px]"
                 showColorScale: true
                 colorScaleMaxText: controller.maxDifference.toFixed(1)
@@ -361,11 +374,12 @@ Window {
                     return "";
                 }
                 
-                xMin: (instancedWindow.popupImageIndex === 1) ? 0 : -256
-                xMax: (instancedWindow.popupImageIndex === 1) ? 180 : 256
-                yMin: -256
-                yMax: 256
+                xMin: (instancedWindow.popupImageIndex === 1) ? 0 : -controller.volumeSize / 2
+                xMax: (instancedWindow.popupImageIndex === 1) ? 180 : controller.volumeSize / 2
+                yMin: -controller.volumeSize / 2
+                yMax: controller.volumeSize / 2
                 
+
                 xLabel: (instancedWindow.popupImageIndex === 1) ? "Angle [deg]" : "X [px]"
                 yLabel: (instancedWindow.popupImageIndex === 1) ? "Detector Pos [px]" : "Y [px]"
                 
