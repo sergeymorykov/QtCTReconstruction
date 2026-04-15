@@ -77,24 +77,23 @@ __global__ void generateEllipsoidsParamsKernel(
     ellipsoids[i].hu = hu;
 }
 
-__global__ void generateVolumeKernelLarge(
+__global__ void generateSliceKernelLarge(
     float* vol,
     int w, int h, int d,
     float x_min, float x_max,
     float y_min, float y_max,
-    float z_min, float z_max,
+    float z_val,
     const GpuEllipsoid* __restrict__ ellipsoids,
     int num_ellipsoids) 
 {
     int x_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int y_idx = blockIdx.y * blockDim.y + threadIdx.y;
-    int z_idx = blockIdx.z * blockDim.z + threadIdx.z;
 
-    if (x_idx >= w || y_idx >= h || z_idx >= d) return;
+    if (x_idx >= w || y_idx >= h) return;
 
     float fx = x_min + (float)x_idx * (x_max - x_min) / (float)(w - 1);
     float fy = y_min + (float)y_idx * (y_max - y_min) / (float)(h - 1);
-    float fz = z_min + (float)z_idx * (z_max - z_min) / (float)(d - 1);
+    float fz = z_val;
 
     float max_hu = -1000.0f;
 
@@ -112,7 +111,7 @@ __global__ void generateVolumeKernelLarge(
         }
     }
 
-    vol[(z_idx * h + y_idx) * w + x_idx] = max_hu;
+    vol[y_idx * w + x_idx] = max_hu;
 }
 
 } // namespace
@@ -145,24 +144,28 @@ Volume Generator3DGPU::generateBrainHU(const Generator3D::Params& params) {
         d_ellipsoids, num_ell, (unsigned long long)params.seed, range,
         params.soft_tissue, params.bone_tissue);
 
-    // Rasterize volume using generated ellipsoids
-    float* d_vol = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_vol, w * h * d * sizeof(float)));
+    // Rasterize volume using generated ellipsoids, slice by slice to save VRAM
+    float* d_slice = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_slice, w * h * sizeof(float)));
 
-    dim3 block(8, 8, 8);
-    dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y, (d + block.z - 1) / block.z);
+    dim3 block(16, 16);
+    dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
 
-    generateVolumeKernelLarge<<<grid, block>>>(d_vol, (int)w, (int)h, (int)d, 
-                                               -range, range, -range, range, -range, range, 
-                                               d_ellipsoids, num_ell);
+    for (size_t z = 0; z < d; ++z) {
+        float fz = -range + (float)z * (2.0f * range) / (float)(d - 1);
+        
+        generateSliceKernelLarge<<<grid, block>>>(d_slice, (int)w, (int)h, (int)d, 
+                                                   -range, range, -range, range, fz, 
+                                                   d_ellipsoids, num_ell);
+        
+        // Copy rasterized slice back to CPU
+        CUDA_CHECK(cudaMemcpy(vol.data.data() + (z * w * h), d_slice, w * h * sizeof(float), cudaMemcpyDeviceToHost));
+    }
     
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Copy rasterized volume back to CPU
-    CUDA_CHECK(cudaMemcpy(vol.data.data(), d_vol, w * h * d * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    cudaFree(d_vol);
+    cudaFree(d_slice);
     cudaFree(d_ellipsoids);
 
     // Setup coordinates (same as CPU)

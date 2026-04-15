@@ -537,25 +537,21 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
     for(size_t i=0; i<params.num_angles; ++i) angles[i] = i * step;
     ensureTrigTables(angles);
 
-    ensureWorkspace(width, height, depth, params.num_angles, width);
-
-    // 2. Копируем ВЕСЬ объем на GPU один раз
-    CUDA_CHECK(cudaMemcpy(m_d_vol_in, input_volume.data.data(), depth * width * height * sizeof(float), cudaMemcpyHostToDevice));
+    ensureWorkspace(width, height, 1, params.num_angles, width);
 
     std::vector<float> slice_min(depth, 0.0f);
     std::vector<float> slice_max(depth, 0.0f);
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
+    float total_sino_ms = 0.0f;
 
-    // 3. Цикл по срезам внутри GPU (будет использовать Workspaces)
+    // 3. Цикл по срезам внутри GPU (с загрузкой по 1 срезу для экономии VRAM)
     for (size_t z = 0; z < depth; ++z) {
-        // Мы можем оптимизировать это еще сильнее, запустив ядра на весь объем,
-        // но для начала устраним malloc/free и лишние копии.
+        auto t_sino_start = std::chrono::high_resolution_clock::now();
 
-        thrust::device_ptr<float> dp(m_d_vol_in + (z * width * height));
+        // Copy ONE slice to m_d_vol_in
+        CUDA_CHECK(cudaMemcpy(m_d_vol_in, input_volume.data.data() + (z * width * height), width * height * sizeof(float), cudaMemcpyHostToDevice));
+
+        thrust::device_ptr<float> dp(m_d_vol_in);
         float vmin = *thrust::min_element(dp, dp + (width * height));
         float vmax = *thrust::max_element(dp, dp + (width * height));
         
@@ -566,7 +562,7 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
         if (span < 1e-6f) span = 1.0f;
         float inv_span = 1.0f / span;
         int grid_norm = (int)((width * height + 255) / 256);
-        normalizeGPUKernel<<<grid_norm, 256>>>(m_d_vol_in + (z * width * height), width * height, vmin, inv_span);
+        normalizeGPUKernel<<<grid_norm, 256>>>(m_d_vol_in, width * height, vmin, inv_span);
 
         // Forward Projection (Scatter)
         dim3 block(16, 16);
@@ -576,36 +572,24 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
         float cy = (float)(height - 1) * 0.5f;
         float detector_center = (float)((int)width / 2); // Предполагаем bins = width
 
-        // Очищаем текущий срез синограммы
-        CUDA_CHECK(cudaMemset(m_d_sino + (z * params.num_angles * width), 0, params.num_angles * width * sizeof(float)));
+        // Очищаем m_d_sino (1 срез)
+        CUDA_CHECK(cudaMemset(m_d_sino, 0, params.num_angles * width * sizeof(float)));
 
         radonForwardScatterKernel<<<grid, block>>>(
-            m_d_vol_in + (z * width * height), 
+            m_d_vol_in, 
             m_d_sino, (int)width, (int)height,
             (int)params.num_angles, (int)width, 
-            cx, cy, detector_center, (int)z
+            cx, cy, detector_center, 0
         );
-    }
 
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float ms = 0;
-    cudaEventElapsedTime(&ms, start, stop);
-    m_lastSinogramTimeMs = static_cast<double>(ms);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto t_sino_end = std::chrono::high_resolution_clock::now();
+        total_sino_ms += std::chrono::duration<float, std::milli>(t_sino_end - t_sino_start).count();
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
-    // 4. Batch Reconstruction (FFT и Backprojection)
-    //Для краткости вызываем существующий reconstructSlice, но он теперь использует Device-Device копии.
-    // На реально больших данных здесь следовало бы делать Batch cuFFT.
-    
-    for (size_t z = 0; z < depth; ++z) {
+        // Download sinogram to Host to use reconstructSlice logic
         Sinogram s;
         s.data.assign(params.num_angles, width, 0.0f);
-        // Копируем готовую синограмму из пакетного буфера обратно для reconstructSlice (или рефакторим дальше)
-        // В данном случае, чтобы не ломать логику IReconstructionBackend, копируем точечно.
-        CUDA_CHECK(cudaMemcpy(s.data.data.data(), m_d_sino + (z * params.num_angles * width), params.num_angles * width * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(s.data.data.data(), m_d_sino, params.num_angles * width * sizeof(float), cudaMemcpyDeviceToHost));
         s.angles_deg = angles;
         s.original_min_hu = slice_min[z];
         s.original_max_hu = slice_max[z];
@@ -615,6 +599,8 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
 
         if (onSliceDone) onSliceDone((int)z, recon);
     }
+
+    m_lastSinogramTimeMs = static_cast<double>(total_sino_ms);
 }
 
 PointCloud CUDABackend::extractPointCloud(const Volume& vol, float threshold) {
