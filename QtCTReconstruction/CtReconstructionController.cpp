@@ -29,6 +29,7 @@
 #include <string>
 
 #include <omp.h>
+#include <cuda_runtime.h>
 
 namespace {
 
@@ -564,39 +565,62 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     ct::Slice diff_mid;
 
     // ---------------------------------------------------------------
-    // ЕДИНЫЙ цикл: нормализация -> синограмма -> реконструкция.
+    // ОПТИМИЗИРОВАНО: Пакетная реконструкция всего объема сразу.
+    // Это устраняет пробелы в работе GPU и накладные расходы API.
     // ---------------------------------------------------------------
     const auto t_total_start = std::chrono::steady_clock::now();
 
-    for (int z = 0; z < depth; ++z) {
-        if (z == 0 || z == mid_z || z == depth - 1) {
-            qDebug() << "[CT] computeAll: processing slice" << z << "/" << depth;
-        }
+    qDebug() << "[CT] computeAll: starting batch volume reconstruction on backend...";
+    
+    ct::Volume reconstructed_volume;
 
+    // --- ТОЧНОЕ ПРОФИЛИРОВАНИЕ GPU ---
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    backendImpl->reconstructVolume(volume, reconstructed_volume, params, nullptr);
+    cudaEventRecord(stop);
+    
+    cudaEventSynchronize(stop);
+    float gpu_compute_ms = 0;
+    cudaEventElapsedTime(&gpu_compute_ms, start, stop);
+
+    const auto t_recon_done = std::chrono::steady_clock::now();
+    results.sinogramTimeSec = 0.0; 
+    results.reconTimeSec = std::chrono::duration<double>(t_recon_done - t_total_start).count();
+    
+    qDebug() << "[CT] computeAll: batch recon done.";
+    qDebug() << "[BENCH] GPU Compute Only:" << gpu_compute_ms << "ms";
+    qDebug() << "[BENCH] Total (with CPU logic):" << (results.reconTimeSec * 1000.0) << "ms";
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    qDebug() << "[CT] computeAll: Generating images for UI...";
+
+    // Постобработка: генерируем QImage параллельно на CPU (OpenMP)
+    #pragma omp parallel for
+    for (int z = 0; z < depth; ++z) {
         const size_t zi = static_cast<size_t>(z);
         const ct::Slice& original = volume.getSlice(zi);
+        const ct::Slice& reconstruction = reconstructed_volume.getSlice(zi);
+        ct::Slice differences = ct::utils::subtract(reconstruction, original);
 
-        // 1. Синограмма (уже делает нормализацию внутри бэкенда)
-        const size_t detector_bins = original.height;
-        ct::Sinogram sinogram = backendImpl->computeSinogram(original, params.num_angles, detector_bins);
-        (*results.sinogramImages)[zi] = sinogramToImage(sinogram);
-
-        if (z == mid_z) {
-            const auto t_mid = std::chrono::steady_clock::now();
-            results.sinogramTimeSec = std::chrono::duration<double>(t_mid - t_total_start).count();
-            qDebug() << "[CT] computeAll: sinogram stage (mid) done, seconds=" << results.sinogramTimeSec;
+        // ✅ ИСПРАВЛЕНИЕ: Генерация синограммы для UI (пересчет на CPU, чтобы не грузить транзакции GPU)
+        // Это быстро для 256^2 на многоядерном CPU
+        if (results.sinogramImages && zi < results.sinogramImages->size()) {
+            ct::Sinogram temp_sino = backendImpl->computeSinogram(original, params.num_angles, original.width);
+            (*results.sinogramImages)[zi] = sinogramToImage(temp_sino);
         }
 
-        // 2. Реконструкция из уже готовой синограммы (и денормализация внутри бэкенда)
-        ct::Slice reconstruction = backendImpl->reconstructSlice(sinogram, original.width, params);
-
-        ct::Slice differences = ct::utils::subtract(reconstruction, original);
         (*results.originalImages)[zi]       = sliceToImage(original, false);
         (*results.reconstructionImages)[zi] = sliceToImage(reconstruction, false);
         (*results.differenceImages)[zi]     = sliceToImage(differences, true);
 
-        if (!asBufferVal) {
-            emit sliceUpdated(z);
+        if (!asBufferVal && (z % 10 == 0 || z == depth - 1)) {
+            QMetaObject::invokeMethod(this, [this, z]() { emit sliceUpdated(z); }, Qt::QueuedConnection);
         }
 
         if (z == mid_z) {
