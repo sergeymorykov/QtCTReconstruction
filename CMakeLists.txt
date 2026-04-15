@@ -66,6 +66,14 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     comctl32
 )
 
+# === FIX FOR MSVC: LLVM OpenMP + C++ Exception Semantics ===
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>
+        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+    )
+endif()
+
 # QML files (Qt 6 resource system)
 qt_add_qml_module(${PROJECT_NAME}
     URI QtCTReconstruction
