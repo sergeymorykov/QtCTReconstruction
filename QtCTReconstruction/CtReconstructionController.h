@@ -21,6 +21,7 @@ class CtReconstructionController : public QObject {
     Q_PROPERTY(double genTimeSec READ genTimeSec NOTIFY timingsChanged)
     Q_PROPERTY(double sinogramTimeSec READ sinogramTimeSec NOTIFY timingsChanged)
     Q_PROPERTY(double reconTimeSec READ reconTimeSec NOTIFY timingsChanged)
+    Q_PROPERTY(double maxDifference READ maxDifference NOTIFY maxDifferenceChanged)
 
     Q_PROPERTY(int filterType READ filterType WRITE setFilterType NOTIFY filterTypeChanged)
     Q_PROPERTY(int backendType READ backendType WRITE setBackendType NOTIFY backendTypeChanged)
@@ -39,6 +40,7 @@ public:
     double genTimeSec() const;
     double sinogramTimeSec() const;
     double reconTimeSec() const;
+    double maxDifference() const;
 
     int filterType() const;
     int backendType() const;
@@ -71,6 +73,7 @@ signals:
     void filterTypeChanged();
     void backendTypeChanged();
     void asBufferChanged();
+    void maxDifferenceChanged();
     void sliceUpdated(int index);
 
 private:
@@ -86,6 +89,7 @@ public:
         double genTimeSec = 0.0;
         double sinogramTimeSec = 0.0;
         double reconTimeSec = 0.0;
+        double maxDifference = 50.0;
         using ImageVec = std::shared_ptr<std::vector<QImage>>;
         ImageVec originalImages;
         ImageVec sinogramImages;
@@ -96,7 +100,7 @@ public:
 private:
     QImage getImage(ImageKind kind, int z) const;
 
-    static QImage sliceToImage(const ct::Slice& slice, bool difference_map);
+    static QImage sliceToImage(const ct::Slice& slice, bool difference_map, float max_diff = 50.0f);
     static QImage sinogramToImage(const ct::Sinogram& sinogram);
 
     ReconstructionResult generateVolumeTask();
@@ -120,6 +124,7 @@ private:
     double m_genTimeSec = 0.0;
     double m_sinogramTimeSec = 0.0;
     double m_reconTimeSec = 0.0;
+    double m_maxDifference = 50.0;
 
     std::vector<QImage> m_originalImages;
     std::vector<QImage> m_sinogramImages;

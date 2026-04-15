@@ -14,6 +14,7 @@ Item {
     property string yLabel: "Y"
     property bool stretchX: false
     property bool showColorScale: false
+    property string colorScaleMaxText: "50"
     property color accentColor: "#64b5f6"
 
     signal clicked()
@@ -105,7 +106,7 @@ Item {
                 Layout.fillHeight: true
                 spacing: 2
 
-                Label { text: "50"; color: "#aaa"; font.pixelSize: 10; Layout.alignment: Qt.AlignHCenter }
+                Label { text: root.colorScaleMaxText; color: "#aaa"; font.pixelSize: 10; Layout.alignment: Qt.AlignHCenter }
 
                 Rectangle {
                     Layout.fillHeight: true

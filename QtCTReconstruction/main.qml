@@ -243,6 +243,7 @@ Window {
                 xMin: -256; xMax: 256; yMin: -256; yMax: 256
                 xLabel: "X [px]"; yLabel: "Y [px]"
                 showColorScale: true
+                colorScaleMaxText: controller.maxDifference.toFixed(1)
                 onClicked: { popupWindowComponent.createObject(root, { "popupImageIndex": 3 }); }
             }
         }
@@ -370,6 +371,7 @@ Window {
                 
                 stretchX: (instancedWindow.popupImageIndex === 1)
                 showColorScale: (instancedWindow.popupImageIndex === 3)
+                colorScaleMaxText: controller.maxDifference.toFixed(1)
             }
         }
     }

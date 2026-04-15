@@ -46,7 +46,7 @@ QImage makeEmptyImage() {
 ct::ReconstructionParams defaultReconstructionParams() {
     ct::ReconstructionParams params;
     params.filter = ct::ReconstructionParams::FilterType::SheppLogan;
-    params.num_angles = 180;
+    params.num_angles = 360;
     params.zero_padding = true;
     return params;
 }
@@ -61,6 +61,11 @@ CtReconstructionController::~CtReconstructionController() = default;
 int CtReconstructionController::maxZ() const {
     QMutexLocker lock(&m_mutex);
     return m_maxZ;
+}
+
+double CtReconstructionController::maxDifference() const {
+    QMutexLocker lock(&m_mutex);
+    return m_maxDifference;
 }
 
 int CtReconstructionController::currentZ() const {
@@ -243,7 +248,7 @@ QImage CtReconstructionController::imageSinogram(const int z) const { return get
 QImage CtReconstructionController::imageReconstruction(const int z) const { return getImage(ImageKind::Reconstruction, z); }
 QImage CtReconstructionController::imageDifference(const int z) const { return getImage(ImageKind::Difference, z); }
 
-QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bool difference_map) {
+QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bool difference_map, float max_diff) {
     const int width = static_cast<int>(slice.width);
     const int height = static_cast<int>(slice.height);
 
@@ -279,8 +284,8 @@ QImage CtReconstructionController::sliceToImage(const ct::Slice& slice, const bo
 
             float n;
             if (difference_map) {
-                // Модуль разницы в фиксированном диапазоне 0—50 HU
-                n = ct::utils::clamp(std::abs(v) / 50.0f, 0.0f, 1.0f);
+                // Модуль разницы в диапазоне 0—max_diff
+                n = ct::utils::clamp(std::abs(v) / (max_diff > 1e-6f ? max_diff : 1.0f), 0.0f, 1.0f);
             } else {
                 // Обычная нормализация для остальных типов изображений
                 n = ct::utils::clamp((v - min_v) * inv_span, 0.0f, 1.0f);
@@ -615,17 +620,16 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     float vmin = std::numeric_limits<float>::max();
     float vmax = std::numeric_limits<float>::lowest();
 
-    // Постобработка: генерируем QImage параллельно на CPU (OpenMP)
+    // Первый проход: метрики
     #pragma omp parallel for reduction(+:global_mse, global_mae, cnt) reduction(max:max_abs, vmax) reduction(min:vmin)
     for (int z = 0; z < depth; ++z) {
         const size_t zi = static_cast<size_t>(z);
         const ct::Slice& original = volume.getSlice(zi);
         const ct::Slice& reconstruction = reconstructed_volume.getSlice(zi);
-        ct::Slice differences = ct::utils::subtract(reconstruction, original);
 
         for (size_t y = 0; y < original.height; ++y) {
             for (size_t x = 0; x < original.width; ++x) {
-                const float diff = differences[y][x];
+                const float diff = reconstruction[y][x] - original[y][x];
                 const float orig = original[y][x];
                 
                 global_mse += static_cast<double>(diff) * static_cast<double>(diff);
@@ -636,9 +640,19 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
                 cnt++;
             }
         }
+    }
 
-        // ✅ ИСПРАВЛЕНИЕ: Генерация синограммы для UI (пересчет на CPU, чтобы не грузить транзакции GPU)
-        // Это быстро для 256^2 на многоядерном CPU
+    if (max_abs < 1e-6f) max_abs = 1.0f;
+    results.maxDifference = max_abs;
+
+    // Второй проход: генерация QImage
+    #pragma omp parallel for
+    for (int z = 0; z < depth; ++z) {
+        const size_t zi = static_cast<size_t>(z);
+        const ct::Slice& original = volume.getSlice(zi);
+        const ct::Slice& reconstruction = reconstructed_volume.getSlice(zi);
+        ct::Slice differences = ct::utils::subtract(reconstruction, original);
+
         if (results.sinogramImages && zi < results.sinogramImages->size()) {
             ct::Sinogram temp_sino = backendImpl->computeSinogram(original, params.num_angles, original.width);
             (*results.sinogramImages)[zi] = sinogramToImage(temp_sino);
@@ -646,7 +660,7 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
 
         (*results.originalImages)[zi]       = sliceToImage(original, false);
         (*results.reconstructionImages)[zi] = sliceToImage(reconstruction, false);
-        (*results.differenceImages)[zi]     = sliceToImage(differences, true);
+        (*results.differenceImages)[zi]     = sliceToImage(differences, true, max_abs);
 
         if (!asBufferVal && (z % 10 == 0 || z == depth - 1)) {
             QMetaObject::invokeMethod(this, [this, z]() { emit sliceUpdated(z); }, Qt::QueuedConnection);
@@ -721,6 +735,7 @@ void CtReconstructionController::applyResult(const ReconstructionResult& result)
         }
         m_sinogramTimeSec  = result.sinogramTimeSec;
         m_reconTimeSec     = result.reconTimeSec;
+        m_maxDifference    = result.maxDifference;
         m_originalImagesPtr        = result.originalImages;
         m_sinogramImagesPtr        = result.sinogramImages;
         m_reconstructionImagesPtr  = result.reconstructionImages;
@@ -734,4 +749,5 @@ void CtReconstructionController::applyResult(const ReconstructionResult& result)
     emit maxZChanged();
     emit currentZChanged();
     emit timingsChanged();
+    emit maxDifferenceChanged();
 }
