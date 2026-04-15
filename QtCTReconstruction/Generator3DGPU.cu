@@ -48,12 +48,13 @@ __global__ void generateEllipsoidsParamsKernel(
     float u_phi = uniformFloatGPU(&state, -1.0f, 1.0f);
     float phi = acosf(u_phi);
 
+    float effective_radius = fmaxf(0.0f, radius - tissue.size_max_mm);
     float r = 0.0f;
     if (tissue.peripheral_only) {
-        r = uniformFloatGPU(&state, tissue.peripheral_radius_min * radius, tissue.peripheral_radius_max * radius);
+        r = uniformFloatGPU(&state, tissue.peripheral_radius_min * effective_radius, tissue.peripheral_radius_max * effective_radius);
     } else {
         float u_r = uniformFloatGPU(&state, 0.0f, 1.0f);
-        r = radius * cbrtf(u_r);
+        r = effective_radius * cbrtf(u_r);
     }
 
     float sin_phi = sinf(phi);

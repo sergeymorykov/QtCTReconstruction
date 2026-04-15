@@ -538,6 +538,8 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     else if (filterId == 1) params.filter = ct::ReconstructionParams::FilterType::SheppLogan;
     else if (filterId == 2) params.filter = ct::ReconstructionParams::FilterType::Hamming;
     else if (filterId == 3) params.filter = ct::ReconstructionParams::FilterType::Cosine;
+    else if (filterId == 4) params.filter = ct::ReconstructionParams::FilterType::Hann;
+    else if (filterId == 5) params.filter = ct::ReconstructionParams::FilterType::Bartlett;
 
     // --- Создаём бэкенд ---
     auto backendImpl = ct::BackendFactory::create(static_cast<ct::BackendFactory::BackendType>(backendId));
@@ -606,13 +608,34 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
 
     qDebug() << "[CT] computeAll: Generating images for UI...";
 
+    double global_mse = 0.0;
+    double global_mae = 0.0;
+    float max_abs = 0.0f;
+    size_t cnt = 0;
+    float vmin = std::numeric_limits<float>::max();
+    float vmax = std::numeric_limits<float>::lowest();
+
     // Постобработка: генерируем QImage параллельно на CPU (OpenMP)
-    #pragma omp parallel for
+    #pragma omp parallel for reduction(+:global_mse, global_mae, cnt) reduction(max:max_abs, vmax) reduction(min:vmin)
     for (int z = 0; z < depth; ++z) {
         const size_t zi = static_cast<size_t>(z);
         const ct::Slice& original = volume.getSlice(zi);
         const ct::Slice& reconstruction = reconstructed_volume.getSlice(zi);
         ct::Slice differences = ct::utils::subtract(reconstruction, original);
+
+        for (size_t y = 0; y < original.height; ++y) {
+            for (size_t x = 0; x < original.width; ++x) {
+                const float diff = differences[y][x];
+                const float orig = original[y][x];
+                
+                global_mse += static_cast<double>(diff) * static_cast<double>(diff);
+                global_mae += std::abs(static_cast<double>(diff));
+                max_abs = std::max(max_abs, std::abs(diff));
+                vmin = std::min(vmin, orig);
+                vmax = std::max(vmax, orig);
+                cnt++;
+            }
+        }
 
         // ✅ ИСПРАВЛЕНИЕ: Генерация синограммы для UI (пересчет на CPU, чтобы не грузить транзакции GPU)
         // Это быстро для 256^2 на многоядерном CPU
@@ -640,25 +663,18 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     const double totalSec = std::chrono::duration<double>(t_total_end - t_total_start).count();
     results.reconTimeSec = totalSec - results.sinogramTimeSec;
 
-    // --- Метрики качества на среднем срезе ---
-    double mse = 0.0;
-    size_t cnt = 0;
-    float vmin = std::numeric_limits<float>::max();
-    float vmax = std::numeric_limits<float>::lowest();
-    for (size_t y = 0; y < diff_mid.height; ++y) {
-        for (size_t x = 0; x < diff_mid.width; ++x) {
-            const float d = diff_mid[y][x];
-            mse += static_cast<double>(d) * static_cast<double>(d);
-            ++cnt;
-            vmin = std::min(vmin, original_mid[y][x]);
-            vmax = std::max(vmax, original_mid[y][x]);
-        }
-    }
-    mse = (cnt > 0) ? (mse / static_cast<double>(cnt)) : 0.0;
+    global_mse = (cnt > 0) ? (global_mse / static_cast<double>(cnt)) : 0.0;
+    global_mae = (cnt > 0) ? (global_mae / static_cast<double>(cnt)) : 0.0;
+
     const double range = static_cast<double>(vmax - vmin);
-    const double psnr  = (mse <= 0.0 || range <= 0.0)
+    const double psnr  = (global_mse <= 0.0 || range <= 0.0)
                          ? std::numeric_limits<double>::infinity()
-                         : 10.0 * std::log10((range * range) / mse);
+                         : 10.0 * std::log10((range * range) / global_mse);
+
+    qDebug() << "[METRICS] Global Max Absolute Error =" << max_abs;
+    qDebug() << "[METRICS] Global MAE =" << global_mae;
+    qDebug() << "[METRICS] Global MSE =" << global_mse;
+    qDebug() << "[METRICS] Global PSNR =" << psnr;
 
     // --- BMP для анализа ---
     const std::wstring originalPath       = outputDirW + L"\\original_middle.bmp";
@@ -675,7 +691,9 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
         metrics << std::fixed << std::setprecision(6);
         metrics << "input_npy=" << inputNpyA << "\n";
         metrics << "mid_z=" << mid_z << "\n";
-        metrics << "mse=" << mse << "\n";
+        metrics << "global_mse=" << global_mse << "\n";
+        metrics << "global_mae=" << global_mae << "\n";
+        metrics << "max_abs_error=" << max_abs << "\n";
         metrics << "psnr=";
         if (std::isfinite(psnr)) { metrics << psnr; } else { metrics << "inf"; }
         metrics << "\n--- Timing (seconds) ---\n";

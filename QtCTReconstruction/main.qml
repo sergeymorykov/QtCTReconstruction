@@ -93,7 +93,7 @@ Window {
 
             Label { text: "Filter:"; color: "white" }
             ComboBox {
-                model: ["Ramp", "Shepp-Logan", "Hamming", "Cosine"]
+                model: ["Ramp", "Shepp-Logan", "Hamming", "Cosine", "Hann", "Bartlett"]
                 currentIndex: controller.filterType
                 onCurrentIndexChanged: controller.filterType = currentIndex
                 implicitWidth: 150

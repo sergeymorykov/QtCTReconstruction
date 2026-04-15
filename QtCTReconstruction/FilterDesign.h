@@ -13,6 +13,8 @@ public:
     static std::vector<float> sheppLogan(size_t n);
     static std::vector<float> hamming(size_t n);
     static std::vector<float> cosine(size_t n);
+    static std::vector<float> hann(size_t n);
+    static std::vector<float> bartlett(size_t n);
 };
 
 } // namespace ct

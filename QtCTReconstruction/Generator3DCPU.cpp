@@ -36,17 +36,18 @@ inline EllipsoidSpec makeEllipsoidSpec(std::mt19937& rng, const Generator3D::Par
     constexpr float kTwoPi = 6.2831853071795864769f;
 
     const float radius = params.brain_radius_mm;
+    const float effective_radius = std::max(0.0f, radius - tissue.size_max_mm);
     const float theta = uniformFloat(rng, 0.0f, kTwoPi);
     const float phi = std::acos(uniformFloat(rng, -1.0f, 1.0f));
 
     float r = 0.0f;
     if (tissue.peripheral_only) {
-        const float rmin = tissue.peripheral_radius_min * radius;
-        const float rmax = tissue.peripheral_radius_max * radius;
+        const float rmin = tissue.peripheral_radius_min * effective_radius;
+        const float rmax = tissue.peripheral_radius_max * effective_radius;
         r = uniformFloat(rng, rmin, rmax);
     } else {
         const float u = uniformFloat(rng, 0.0f, 1.0f);
-        r = radius * std::cbrt(u);
+        r = effective_radius * std::cbrt(u);
     }
 
     const float sin_phi = std::sin(phi);

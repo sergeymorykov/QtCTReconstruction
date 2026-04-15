@@ -137,7 +137,7 @@ struct Sinogram {
 };
 
 struct ReconstructionParams {
-    enum class FilterType { Ramp, SheppLogan, Hamming, Cosine };
+    enum class FilterType { Ramp, SheppLogan, Hamming, Cosine, Hann, Bartlett };
 
     FilterType filter = FilterType::SheppLogan;
     size_t num_angles = 180;
