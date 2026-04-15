@@ -254,6 +254,19 @@ void CUDABackend::ensureWorkspace(size_t w, size_t h, size_t d, size_t num_angle
     size_t vol_req = w * h * d;
     size_t sino_req = num_angles * bins * d;
 
+    // Буфер для спектра (FFT)
+    const size_t square_bins = static_cast<size_t>(std::ceil(std::sqrt(2.0) * static_cast<double>(bins)));
+    const size_t padding_factor = 8;
+    const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
+    size_t complex_size = projection_size_padded / 2 + 1;
+    size_t spec_req = num_angles * complex_size;
+
+    // В reconstructSlice мы используем m_d_vol_out как d_sino_padded, размер которого:
+    size_t padded_sino_req = num_angles * projection_size_padded;
+    if (vol_req < padded_sino_req) {
+        vol_req = padded_sino_req;
+    }
+
     if (m_volSize < vol_req) {
         if (m_d_vol_in) cudaFree(m_d_vol_in);
         if (m_d_vol_out) cudaFree(m_d_vol_out);
@@ -267,13 +280,6 @@ void CUDABackend::ensureWorkspace(size_t w, size_t h, size_t d, size_t num_angle
         CUDA_CHECK(cudaMalloc(&m_d_sino, sino_req * sizeof(float)));
         m_sinoSize = sino_req;
     }
-
-    // Буфер для спектра (FFT)
-    const size_t square_bins = static_cast<size_t>(std::ceil(std::sqrt(2.0) * static_cast<double>(bins)));
-    const size_t padding_factor = 8;
-    const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
-    size_t complex_size = projection_size_padded / 2 + 1;
-    size_t spec_req = num_angles * complex_size;
 
     if (m_spectrumSize < spec_req) {
         if (m_d_spectrum) cudaFree(m_d_spectrum);
