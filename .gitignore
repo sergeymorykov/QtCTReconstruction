@@ -362,5 +362,6 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 
-# Book
+# Source
 book/
+CPU_EXAMPLE.md
