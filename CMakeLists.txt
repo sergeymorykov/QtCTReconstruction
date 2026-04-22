@@ -72,6 +72,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>
+        $<$<COMPILE_LANGUAGE:CXX>:/openmp:experimental>
         $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
     )
 endif()
