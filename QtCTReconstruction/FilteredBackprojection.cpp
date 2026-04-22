@@ -44,7 +44,7 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
         }
     }
 
-    const size_t padding_factor = 8;
+    const size_t padding_factor = 2;
     const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
     const auto filter = FilterDesign::createFilter(projection_size_padded, params.filter);
 

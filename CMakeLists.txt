@@ -39,6 +39,8 @@ set(SOURCES
     QtCTReconstruction/OpenMPBackend.cpp
     QtCTReconstruction/CUDABackend.cu
     QtCTReconstruction/PointCloudGeometry.cpp
+    QtCTReconstruction/OptimizedBackprojectionCPU.cpp
+    QtCTReconstruction/ProjectionGeometry.cpp
 )
 
 qt_add_executable(${PROJECT_NAME} MANUAL_FINALIZATION ${SOURCES})

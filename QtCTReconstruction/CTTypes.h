@@ -136,6 +136,17 @@ struct Sinogram {
     float original_max_hu = 0.0f;
 };
 
+struct ProjectionMatrix {
+    float data[3][4]; // 3x4 projection matrix
+};
+
+struct CTGeometry {
+    int nx, ny, nz;      // Volume resolution
+    int nw, nh;          // Detector resolution (width, height)
+    int np;              // Number of projections
+    float dx, dy, dz;    // Voxel size (optional, currently redundant with indices)
+};
+
 struct ReconstructionParams {
     enum class FilterType { Ramp, SheppLogan, Hamming, Cosine, Hann, Bartlett };
 
