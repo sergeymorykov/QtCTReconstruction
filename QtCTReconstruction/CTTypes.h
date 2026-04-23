@@ -9,7 +9,7 @@
 
 namespace ct {
 
-using Complex = std::complex<double>;
+using Complex = std::complex<float>;
 
 // Замена std::vector<std::vector<float>> на плоский 1D массив с 2D-интерфейсом.
 struct Buffer2D {

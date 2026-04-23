@@ -100,14 +100,15 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
 
     #pragma omp parallel
     {
-        // Thread-local buffers to avoid allocations in the hot loop
-        std::vector<float> proj_padded(projection_size_padded);
+        // Thread-local buffers: no per-iteration heap allocation
+        std::vector<float>   proj_padded(projection_size_padded);
+        std::vector<Complex> spectrum(projection_size_padded);
 
         #pragma omp for schedule(dynamic)
         for (int z = 0; z < static_cast<int>(depth); ++z) {
             const float* slice_ptr = input_volume.getSlicePtr(z);
             Sinogram sino = computeSinogram(slice_ptr, width, height, num_angles, detector_bins);
-            
+
             min_hus[z] = sino.original_min_hu;
             float s = sino.original_max_hu - sino.original_min_hu;
             spans[z] = (s <= 0.0f) ? 1.0f : s;
@@ -115,27 +116,22 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
             // Filter this sinogram
             for (size_t a = 0; a < num_angles; ++a) {
                 std::fill(proj_padded.begin(), proj_padded.end(), 0.0f);
-                
-                // Optimized Layout: sino.data[a] is contiguous [bin]
+
                 const float* sino_row = sino.data[a];
                 for (size_t i = 0; i < detector_bins; ++i) {
-                    size_t dst_idx = i + pad_before;
-                    if (dst_idx < projection_size_padded) {
+                    const size_t dst_idx = i + pad_before;
+                    if (dst_idx < projection_size_padded)
                         proj_padded[dst_idx] = sino_row[i];
-                    }
                 }
 
-                auto spectrum = FFT::forward(proj_padded);
-                for (size_t k = 0; k < spectrum.size(); ++k) {
-                    spectrum[k] *= static_cast<double>(filter[k]);
-                }
-                const auto q = FFT::inverse(spectrum);
-                
-                // Store in global buffer at index (a * depth + z)
+                FFT::forwardInPlace(proj_padded.data(), spectrum.data(), projection_size_padded);
+                for (size_t k = 0; k < projection_size_padded; ++k)
+                    spectrum[k] *= filter[k];
+                FFT::inverseInPlace(spectrum.data(), projection_size_padded);
+
                 float* dst_row = filtered_projs_all.rowPtr(a * depth + z);
-                for (size_t i = 0; i < square_bins; ++i) {
-                    dst_row[i] = q[i];
-                }
+                for (size_t i = 0; i < square_bins; ++i)
+                    dst_row[i] = spectrum[i].real();
             }
         }
     }

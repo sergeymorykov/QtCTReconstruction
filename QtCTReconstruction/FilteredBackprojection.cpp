@@ -29,7 +29,6 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
     const size_t detector_bins = sinogram.data.width;
 
     const size_t square_bins = static_cast<size_t>(std::ceil(std::sqrt(2.0) * static_cast<double>(detector_bins)));
-    const size_t pad = square_bins - detector_bins;
     const size_t old_center = detector_bins / 2;
     const size_t new_center = square_bins / 2;
     const size_t pad_before = new_center - old_center;
@@ -52,25 +51,29 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
 
     Buffer2D filtered(square_bins, num_angles, 0.0f);
     const int na = static_cast<int>(num_angles);
-    
-    #pragma omp parallel for schedule(dynamic)
-    for (int a = 0; a < na; ++a) {
-        const float* src_proj = sino_square[static_cast<size_t>(a)];
-        
-        std::vector<float> proj_padded(projection_size_padded, 0.0f);
-        for (size_t i = 0; i < square_bins; ++i) {
-            proj_padded[i] = src_proj[i];
-        }
 
-        auto spectrum = FFT::forward(proj_padded);
-        for (size_t k = 0; k < spectrum.size(); ++k) {
-            spectrum[k] *= static_cast<double>(filter[k]);
-        }
-        const auto q = FFT::inverse(spectrum);
-        
-        float* dst_filtered = filtered[static_cast<size_t>(a)];
-        for (size_t i = 0; i < square_bins; ++i) {
-            dst_filtered[i] = q[i];
+    // Thread-local buffers: no per-iteration heap allocation
+    #pragma omp parallel
+    {
+        std::vector<float>   proj_padded(projection_size_padded, 0.0f);
+        std::vector<Complex> spectrum(projection_size_padded);
+
+        #pragma omp for schedule(static)
+        for (int a = 0; a < na; ++a) {
+            const float* src_proj = sino_square[static_cast<size_t>(a)];
+
+            std::fill(proj_padded.begin(), proj_padded.end(), 0.0f);
+            for (size_t i = 0; i < square_bins; ++i)
+                proj_padded[i] = src_proj[i];
+
+            FFT::forwardInPlace(proj_padded.data(), spectrum.data(), projection_size_padded);
+            for (size_t k = 0; k < projection_size_padded; ++k)
+                spectrum[k] *= filter[k];
+            FFT::inverseInPlace(spectrum.data(), projection_size_padded);
+
+            float* dst_filtered = filtered[static_cast<size_t>(a)];
+            for (size_t i = 0; i < square_bins; ++i)
+                dst_filtered[i] = spectrum[i].real();
         }
     }
 
@@ -87,7 +90,7 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
     }
 
     const int ny = static_cast<int>(output_size);
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < ny; ++y) {
         const float yy = static_cast<float>(y) - radius;
         for (size_t x = 0; x < output_size; ++x) {
@@ -102,7 +105,7 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
             for (size_t a = 0; a < num_angles; ++a) {
                 const float t = xx * cos_table[a] - yy * sin_table[a];
                 const float u = t + detector_center;
-                
+
                 const int i0 = static_cast<int>(std::floor(u));
                 const int i1 = i0 + 1;
                 const float frac = u - static_cast<float>(i0);

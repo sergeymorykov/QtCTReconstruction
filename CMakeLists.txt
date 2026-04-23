@@ -77,6 +77,10 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>
         $<$<COMPILE_LANGUAGE:CXX>:/fp:fast>
         $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/O2>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/GL>
+    )
+    target_link_options(${PROJECT_NAME} PRIVATE
+        $<$<CONFIG:Release>:/LTCG>
     )
 endif()
 
