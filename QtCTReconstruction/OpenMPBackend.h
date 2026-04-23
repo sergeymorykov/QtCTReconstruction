@@ -21,6 +21,7 @@ public:
     double lastSinogramTimeMs() const override { return m_lastSinogramTimeMs; }
 
 private:
+    Sinogram computeSinogram(const float* slice_data, size_t w, size_t h, size_t num_angles, size_t detector_bins);
     double m_lastSinogramTimeMs = 0.0;
 };
 

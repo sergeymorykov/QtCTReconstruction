@@ -2,6 +2,7 @@
 #include <cmath>
 #include <algorithm>
 #include <omp.h>
+#include <immintrin.h>
 
 namespace ct {
 
@@ -98,9 +99,37 @@ void OptimizedBackprojectionCPU::reconstruct(Volume& volume,
                         }
                         
                         if (x_start < x_end) {
-                            float u = static_cast<float>(x_start) * du + u0_p_base;
-                            #pragma omp simd
-                            for (int x = x_start; x < x_end; ++x) {
+                            float u_base = static_cast<float>(x_start) * du + u0_p_base;
+                            int x = x_start;
+                            
+                            // AVX2 optimized loop (8 voxels at a time)
+                            __m256 v_du = _mm256_set1_ps(du);
+                            __m256 v_u = _mm256_add_ps(_mm256_set1_ps(u_base), 
+                                         _mm256_mul_ps(v_du, _mm256_set_ps(7.0f, 6.0f, 5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.0f)));
+                            __m256 v_du8 = _mm256_set1_ps(du * 8.0f);
+                            __m256 v_one = _mm256_set1_ps(1.0f);
+
+                            for (; x <= x_end - 8; x += 8) {
+                                __m256i v_u0 = _mm256_cvttps_epi32(v_u);
+                                __m256 v_fu = _mm256_sub_ps(v_u, _mm256_cvtepi32_ps(v_u0));
+                                
+                                // Gather projection values
+                                __m256 v_p0 = _mm256_i32gather_ps(r_p, v_u0, 4);
+                                __m256 v_p1 = _mm256_i32gather_ps(r_p, _mm256_add_epi32(v_u0, _mm256_set1_epi32(1)), 4);
+                                
+                                // Bilinear interpolation: p0 + fu * (p1 - p0)
+                                __m256 v_interp = _mm256_fmadd_ps(v_fu, _mm256_sub_ps(v_p1, v_p0), v_p0);
+                                
+                                // Accumulate into volume
+                                __m256 v_vol = _mm256_loadu_ps(&vol_row_p[x]);
+                                _mm256_storeu_ps(&vol_row_p[x], _mm256_add_ps(v_vol, v_interp));
+                                
+                                v_u = _mm256_add_ps(v_u, v_du8);
+                            }
+
+                            // Remainder loop
+                            float u = static_cast<float>(x) * du + u0_p_base;
+                            for (; x < x_end; ++x) {
                                 const int u0 = static_cast<int>(u);
                                 const float fu = u - static_cast<float>(u0);
                                 vol_row_p[x] += r_p[u0] + fu * (r_p[u0 + 1] - r_p[u0]);
@@ -121,9 +150,31 @@ void OptimizedBackprojectionCPU::reconstruct(Volume& volume,
                         }
 
                         if (x_start < x_end) {
-                            float u = static_cast<float>(x_start) * du + u0_n_base;
-                            #pragma omp simd
-                            for (int x = x_start; x < x_end; ++x) {
+                            float u_base = static_cast<float>(x_start) * du + u0_n_base;
+                            int x = x_start;
+
+                            __m256 v_du = _mm256_set1_ps(du);
+                            __m256 v_u = _mm256_add_ps(_mm256_set1_ps(u_base), 
+                                         _mm256_mul_ps(v_du, _mm256_set_ps(7.0f, 6.0f, 5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.0f)));
+                            __m256 v_du8 = _mm256_set1_ps(du * 8.0f);
+
+                            for (; x <= x_end - 8; x += 8) {
+                                __m256i v_u0 = _mm256_cvttps_epi32(v_u);
+                                __m256 v_fu = _mm256_sub_ps(v_u, _mm256_cvtepi32_ps(v_u0));
+                                
+                                __m256 v_p0 = _mm256_i32gather_ps(r_n, v_u0, 4);
+                                __m256 v_p1 = _mm256_i32gather_ps(r_n, _mm256_add_epi32(v_u0, _mm256_set1_epi32(1)), 4);
+                                
+                                __m256 v_interp = _mm256_fmadd_ps(v_fu, _mm256_sub_ps(v_p1, v_p0), v_p0);
+                                
+                                __m256 v_vol = _mm256_loadu_ps(&vol_row_n[x]);
+                                _mm256_storeu_ps(&vol_row_n[x], _mm256_add_ps(v_vol, v_interp));
+                                
+                                v_u = _mm256_add_ps(v_u, v_du8);
+                            }
+
+                            float u = static_cast<float>(x) * du + u0_n_base;
+                            for (; x < x_end; ++x) {
                                 const int u0 = static_cast<int>(u);
                                 const float fu = u - static_cast<float>(u0);
                                 vol_row_n[x] += r_n[u0] + fu * (r_n[u0 + 1] - r_n[u0]);

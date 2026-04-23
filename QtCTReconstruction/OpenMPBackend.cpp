@@ -16,22 +16,26 @@
 namespace ct {
 
 Sinogram OpenMPBackend::computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins) {
-    if (slice.empty() || num_angles == 0 || detector_bins == 0) return {};
+    return computeSinogram(slice.data.data(), slice.width, slice.height, num_angles, detector_bins);
+}
+
+Sinogram OpenMPBackend::computeSinogram(const float* slice_data, size_t w, size_t h, size_t num_angles, size_t detector_bins) {
+    if (!slice_data || w == 0 || h == 0 || num_angles == 0 || detector_bins == 0) return {};
 
     float hu_min = std::numeric_limits<float>::max();
     float hu_max = std::numeric_limits<float>::lowest();
 
     #pragma omp parallel for reduction(min:hu_min) reduction(max:hu_max)
-    for (int y = 0; y < static_cast<int>(slice.height); ++y) {
-        const float* row = &slice.data[y * slice.width];
-        for (size_t x = 0; x < slice.width; ++x) {
+    for (int y = 0; y < static_cast<int>(h); ++y) {
+        const float* row = slice_data + y * w;
+        for (size_t x = 0; x < w; ++x) {
             float v = row[x];
             if (v < hu_min) hu_min = v;
             if (v > hu_max) hu_max = v;
         }
     }
 
-    return RadonTransform::forward(slice, num_angles, detector_bins, hu_min, hu_max);
+    return RadonTransform::forward(slice_data, w, h, num_angles, detector_bins, hu_min, hu_max);
 }
 
 Buffer2D OpenMPBackend::reconstructSlice(const Sinogram& sinogram, size_t output_size, const ReconstructionParams& params) {
@@ -94,37 +98,44 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
     const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
     const auto filter = FilterDesign::createFilter(projection_size_padded, params.filter);
 
-    #pragma omp parallel for schedule(dynamic)
-    for (int z = 0; z < static_cast<int>(depth); ++z) {
-        Buffer2D original_slice = input_volume.getSlice(z);
-        Sinogram sino = computeSinogram(original_slice, num_angles, detector_bins);
-        
-        min_hus[z] = sino.original_min_hu;
-        float s = sino.original_max_hu - sino.original_min_hu;
-        spans[z] = (s <= 0.0f) ? 1.0f : s;
+    #pragma omp parallel
+    {
+        // Thread-local buffers to avoid allocations in the hot loop
+        std::vector<float> proj_padded(projection_size_padded);
 
-        // Filter this sinogram
-        for (size_t a = 0; a < num_angles; ++a) {
-            std::vector<float> proj_padded(projection_size_padded, 0.0f);
-            for (size_t i = 0; i < detector_bins; ++i) {
-                // Centered padding:
-                size_t dst_idx = i + pad_before;
-                if (dst_idx < projection_size_padded) {
-                    // Reverted Layout: [bin][angle]
-                    proj_padded[dst_idx] = sino.data[i][a];
-                }
-            }
-
-            auto spectrum = FFT::forward(proj_padded);
-            for (size_t k = 0; k < spectrum.size(); ++k) {
-                spectrum[k] *= static_cast<double>(filter[k]);
-            }
-            const auto q = FFT::inverse(spectrum);
+        #pragma omp for schedule(dynamic)
+        for (int z = 0; z < static_cast<int>(depth); ++z) {
+            const float* slice_ptr = input_volume.getSlicePtr(z);
+            Sinogram sino = computeSinogram(slice_ptr, width, height, num_angles, detector_bins);
             
-            // Store in global buffer at index (a * depth + z)
-            float* dst_row = filtered_projs_all.rowPtr(a * depth + z);
-            for (size_t i = 0; i < square_bins; ++i) {
-                dst_row[i] = q[i];
+            min_hus[z] = sino.original_min_hu;
+            float s = sino.original_max_hu - sino.original_min_hu;
+            spans[z] = (s <= 0.0f) ? 1.0f : s;
+
+            // Filter this sinogram
+            for (size_t a = 0; a < num_angles; ++a) {
+                std::fill(proj_padded.begin(), proj_padded.end(), 0.0f);
+                
+                // Optimized Layout: sino.data[a] is contiguous [bin]
+                const float* sino_row = sino.data[a];
+                for (size_t i = 0; i < detector_bins; ++i) {
+                    size_t dst_idx = i + pad_before;
+                    if (dst_idx < projection_size_padded) {
+                        proj_padded[dst_idx] = sino_row[i];
+                    }
+                }
+
+                auto spectrum = FFT::forward(proj_padded);
+                for (size_t k = 0; k < spectrum.size(); ++k) {
+                    spectrum[k] *= static_cast<double>(filter[k]);
+                }
+                const auto q = FFT::inverse(spectrum);
+                
+                // Store in global buffer at index (a * depth + z)
+                float* dst_row = filtered_projs_all.rowPtr(a * depth + z);
+                for (size_t i = 0; i < square_bins; ++i) {
+                    dst_row[i] = q[i];
+                }
             }
         }
     }

@@ -74,6 +74,9 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>
         $<$<COMPILE_LANGUAGE:CXX>:/openmp:experimental>
         $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+        $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>
+        $<$<COMPILE_LANGUAGE:CXX>:/fp:fast>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/O2>
     )
 endif()
 

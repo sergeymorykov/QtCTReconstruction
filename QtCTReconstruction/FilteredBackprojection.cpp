@@ -25,8 +25,8 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
         return {};
     }
 
-    const size_t num_angles = sinogram.data.width;
-    const size_t detector_bins = sinogram.data.height;
+    const size_t num_angles = sinogram.data.height;
+    const size_t detector_bins = sinogram.data.width;
 
     const size_t square_bins = static_cast<size_t>(std::ceil(std::sqrt(2.0) * static_cast<double>(detector_bins)));
     const size_t pad = square_bins - detector_bins;
@@ -34,12 +34,14 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
     const size_t new_center = square_bins / 2;
     const size_t pad_before = new_center - old_center;
 
-    Buffer2D sino_square(num_angles, square_bins, 0.0f);
-    for (size_t i = 0; i < detector_bins; ++i) {
-        const size_t dst = i + pad_before;
-        if (dst < square_bins) {
-            for (size_t a = 0; a < num_angles; ++a) {
-                sino_square[dst][a] = sinogram.data[i][a];
+    Buffer2D sino_square(square_bins, num_angles, 0.0f);
+    for (size_t a = 0; a < num_angles; ++a) {
+        const float* src_row = sinogram.data[a];
+        float* dst_row = sino_square[a];
+        for (size_t i = 0; i < detector_bins; ++i) {
+            const size_t dst = i + pad_before;
+            if (dst < square_bins) {
+                dst_row[dst] = src_row[i];
             }
         }
     }
@@ -48,19 +50,16 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
     const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
     const auto filter = FilterDesign::createFilter(projection_size_padded, params.filter);
 
-    Buffer2D filtered(num_angles, square_bins, 0.0f);
+    Buffer2D filtered(square_bins, num_angles, 0.0f);
     const int na = static_cast<int>(num_angles);
     
     #pragma omp parallel for schedule(dynamic)
     for (int a = 0; a < na; ++a) {
-        std::vector<float> proj(square_bins, 0.0f);
-        for (size_t i = 0; i < square_bins; ++i) {
-            proj[i] = sino_square[i][static_cast<size_t>(a)];
-        }
-
+        const float* src_proj = sino_square[static_cast<size_t>(a)];
+        
         std::vector<float> proj_padded(projection_size_padded, 0.0f);
         for (size_t i = 0; i < square_bins; ++i) {
-            proj_padded[i] = proj[i];
+            proj_padded[i] = src_proj[i];
         }
 
         auto spectrum = FFT::forward(proj_padded);
@@ -68,8 +67,10 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
             spectrum[k] *= static_cast<double>(filter[k]);
         }
         const auto q = FFT::inverse(spectrum);
+        
+        float* dst_filtered = filtered[static_cast<size_t>(a)];
         for (size_t i = 0; i < square_bins; ++i) {
-            filtered[i][static_cast<size_t>(a)] = q[i];
+            dst_filtered[i] = q[i];
         }
     }
 
@@ -102,12 +103,12 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
                 const float t = xx * cos_table[a] - yy * sin_table[a];
                 const float u = t + detector_center;
                 
-                // sampleProjectionLinear equivalent
                 const int i0 = static_cast<int>(std::floor(u));
                 const int i1 = i0 + 1;
                 const float frac = u - static_cast<float>(i0);
                 if (i0 >= 0 && i1 < static_cast<int>(square_bins)) {
-                    sum += utils::lerp(filtered[static_cast<size_t>(i0)][a], filtered[static_cast<size_t>(i1)][a], frac);
+                    const float* f_row = filtered[a];
+                    sum += utils::lerp(f_row[i0], f_row[i1], frac);
                 }
             }
             recon[static_cast<size_t>(y)][x] = sum;
