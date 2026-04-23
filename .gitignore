@@ -364,4 +364,5 @@ FodyWeavers.xsd
 
 # Source
 book/
+example/
 CPU_EXAMPLE.md
