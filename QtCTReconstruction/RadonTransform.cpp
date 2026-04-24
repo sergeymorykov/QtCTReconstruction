@@ -91,6 +91,7 @@ Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, co
     return sino;
 }
 
+
 void RadonTransform::transposeSinogram(Sinogram& sino) {
     if (sino.data.empty()) return;
 
@@ -110,16 +111,4 @@ void RadonTransform::transposeSinogram(Sinogram& sino) {
     sino.data = std::move(transposed);
 }
 
-    sino.angles_deg.resize(num_angles, 0.0f);
-    const float angle_step = 180.0f / static_cast<float>(num_angles);
-    for (size_t a = 0; a < num_angles; ++a) {
-        sino.angles_deg[a] = angle_step * static_cast<float>(a);
-    }
-    sino.detector_spacing_mm = 1.0f;
-    sino.original_min_hu = min_hu;
-    sino.original_max_hu = max_hu;
-
-    return sino;
-}
-
-}
+} // namespace ct
