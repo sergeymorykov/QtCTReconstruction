@@ -9,7 +9,7 @@ public:
     std::string name() const override { return "OpenMP (CPU)"; }
     bool isAvailable() const override { return true; }
 
-    Sinogram computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins) override;
+    Sinogram computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins, bool use_parallel = true) override;
     Buffer2D reconstructSlice(const Sinogram& sinogram, size_t output_size, const ReconstructionParams& params) override;
 
     void reconstructVolume(const Volume& input_volume, 

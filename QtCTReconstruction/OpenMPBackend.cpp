@@ -15,13 +15,13 @@
 
 namespace ct {
 
-Sinogram OpenMPBackend::computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins) {
+Sinogram OpenMPBackend::computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins, bool use_parallel) {
     if (slice.empty() || num_angles == 0 || detector_bins == 0) return {};
 
     float hu_min = std::numeric_limits<float>::max();
     float hu_max = std::numeric_limits<float>::lowest();
 
-    #pragma omp parallel for reduction(min:hu_min) reduction(max:hu_max)
+    #pragma omp parallel for reduction(min:hu_min) reduction(max:hu_max) if(use_parallel)
     for (int y = 0; y < static_cast<int>(slice.height); ++y) {
         const float* row = &slice.data[y * slice.width];
         for (size_t x = 0; x < slice.width; ++x) {
@@ -31,7 +31,7 @@ Sinogram OpenMPBackend::computeSinogram(const Buffer2D& slice, size_t num_angles
         }
     }
 
-    return RadonTransform::forward(slice, num_angles, detector_bins, hu_min, hu_max);
+    return RadonTransform::forward(slice, num_angles, detector_bins, hu_min, hu_max, use_parallel);
 }
 
 Buffer2D OpenMPBackend::reconstructSlice(const Sinogram& sinogram, size_t output_size, const ReconstructionParams& params) {
@@ -94,9 +94,9 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
     const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
     const auto filter = FilterDesign::createFilter(projection_size_padded, params.filter);
 
-    const int nthreads = omp_get_max_threads();
+    const size_t spectrum_size = projection_size_padded / 2 + 1;
     std::vector<std::vector<float>> thread_proj(nthreads, std::vector<float>(projection_size_padded, 0.0f));
-    std::vector<std::vector<Complex>> thread_spectrum(nthreads, std::vector<Complex>(projection_size_padded));
+    std::vector<std::vector<Complex>> thread_spectrum(nthreads, std::vector<Complex>(spectrum_size));
     std::vector<std::vector<float>> thread_q(nthreads, std::vector<float>(projection_size_padded));
 
     #pragma omp parallel for schedule(dynamic)
@@ -107,7 +107,7 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
         auto& q = thread_q[tid];
 
         Buffer2D original_slice = input_volume.getSlice(z);
-        Sinogram sino = computeSinogram(original_slice, num_angles, detector_bins);
+        Sinogram sino = computeSinogram(original_slice, num_angles, detector_bins, false);
         
         min_hus[z] = sino.original_min_hu;
         float s = sino.original_max_hu - sino.original_min_hu;
@@ -117,19 +117,17 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
         for (size_t a = 0; a < num_angles; ++a) {
             std::fill(proj_padded.begin(), proj_padded.end(), 0.0f);
             for (size_t i = 0; i < detector_bins; ++i) {
-                // Centered padding:
                 size_t dst_idx = i + pad_before;
                 if (dst_idx < projection_size_padded) {
-                    // Reverted Layout: [bin][angle]
-                    proj_padded[dst_idx] = sino.data[i][a];
+                    proj_padded[dst_idx] = sino.data[a][i];
                 }
             }
 
-            FFT::forward(proj_padded, spectrum);
-            for (size_t k = 0; k < spectrum.size(); ++k) {
-                spectrum[k] *= static_cast<double>(filter[k]);
+            FFT::forwardReal(proj_padded, spectrum);
+            for (size_t k = 0; k < spectrum_size; ++k) {
+                spectrum[k] *= filter[k];
             }
-            FFT::inverse(spectrum, q);
+            FFT::inverseReal(spectrum, q);
             
             // Store in global buffer at index (a * depth + z)
             float* dst_row = filtered_projs_all.rowPtr(a * depth + z);

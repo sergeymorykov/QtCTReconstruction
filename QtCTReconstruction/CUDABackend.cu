@@ -60,7 +60,7 @@ __global__ void packSinogramKernel(
     int bin   = blockIdx.y * blockDim.y + threadIdx.y;
     if (angle >= num_angles || bin >= detector_bins) return;
 
-    float val = sino_src[bin * num_angles + angle];
+    float val = sino_src[angle * detector_bins + bin];
     sino_dst[angle * projection_size_padded + (bin + pad_before)] = val;
 }
 
@@ -114,10 +114,10 @@ __global__ void radonForwardScatterKernel(
         float frac = u - (float)i0;
 
         if (i0 >= 0 && i0 < detector_bins) {
-            atomicAdd(&sino[(z_slice * detector_bins + i0) * num_angles + a], v * (1.0f - frac));
+            atomicAdd(&sino[(z_slice * num_angles + a) * detector_bins + i0], v * (1.0f - frac));
         }
         if (i1 >= 0 && i1 < detector_bins) {
-            atomicAdd(&sino[(z_slice * detector_bins + i1) * num_angles + a], v * frac);
+            atomicAdd(&sino[(z_slice * num_angles + a) * detector_bins + i1], v * frac);
         }
     }
 }
@@ -342,7 +342,7 @@ bool CUDABackend::isAvailable() const {
     return err == cudaSuccess && count > 0;
 }
 
-Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins) {
+Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins, bool use_parallel) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Sinogram sino;
     if (slice.empty() || num_angles == 0 || detector_bins == 0) return sino;
@@ -355,7 +355,8 @@ Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, 
     float cx = (float)(w - 1) * 0.5f;
     float cy = (float)(h - 1) * 0.5f;
 
-    sino.data.assign(num_angles, detector_bins, 0.0f);
+    // Fast layout: [Angle][Bin] (width = detector_bins, height = num_angles)
+    sino.data.assign(detector_bins, num_angles, 0.0f);
     sino.angles_deg.resize(num_angles, 0.0f);
     float angle_step = 180.0f / (float)num_angles;
     for (size_t a = 0; a < num_angles; ++a) {
@@ -421,8 +422,9 @@ Buffer2D CUDABackend::reconstructSlice(const Sinogram& sinogram, size_t output_s
     Buffer2D recon;
     if (sinogram.data.empty() || output_size == 0) return recon;
 
-    const size_t num_angles = sinogram.data.width;
-    const size_t detector_bins = sinogram.data.height;
+    // New layout: [Angle][Bin] -> Width = detector_bins, Height = num_angles
+    const size_t detector_bins = sinogram.data.width;
+    const size_t num_angles = sinogram.data.height;
 
     const size_t square_bins = static_cast<size_t>(std::ceil(std::sqrt(2.0) * static_cast<double>(detector_bins)));
     const size_t pad_before = (square_bins / 2) - (detector_bins / 2);
@@ -592,9 +594,9 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
         auto t_sino_end = std::chrono::high_resolution_clock::now();
         total_sino_ms += std::chrono::duration<float, std::milli>(t_sino_end - t_sino_start).count();
 
-        // Download sinogram to Host to use reconstructSlice logic
+        // Download sinogram to Host
         Sinogram s;
-        s.data.assign(params.num_angles, width, 0.0f);
+        s.data.assign(width, params.num_angles, 0.0f); // width = bins, height = angles
         CUDA_CHECK(cudaMemcpy(s.data.data.data(), m_d_sino, params.num_angles * width * sizeof(float), cudaMemcpyDeviceToHost));
         s.angles_deg = angles;
         s.original_min_hu = slice_min[z];

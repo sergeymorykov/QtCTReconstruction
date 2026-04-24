@@ -18,7 +18,7 @@ public:
     virtual bool isAvailable() const = 0;
 
     // Выполнение преобразования Радона (создание синограммы из среза)
-    virtual Sinogram computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins) = 0;
+    virtual Sinogram computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins, bool use_parallel = true) = 0;
 
     // Выполнение фильтрации и обратной проекции (реконструкция среза из синограммы)
     virtual Buffer2D reconstructSlice(const Sinogram& sinogram, size_t output_size, const ReconstructionParams& params) = 0;

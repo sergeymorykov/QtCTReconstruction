@@ -334,18 +334,23 @@ QImage CtReconstructionController::sinogramToImage(const ct::Sinogram& sinogram)
         return {};
     }
 
-    const int width = static_cast<int>(sinogram.data.width);
-    const int height = static_cast<int>(sinogram.data.height);
-    QImage img(width, height, QImage::Format_ARGB32);
+    // Fast layout: [Angle][Bin] -> Width = bins, Height = angles
+    // For UI: Horizontal = Angles, Vertical = Bins
+    const int num_bins = static_cast<int>(sinogram.data.width);
+    const int num_angles = static_cast<int>(sinogram.data.height);
+    
+    // UI Image: Width = Angles, Height = Bins
+    QImage img(num_angles, num_bins, QImage::Format_ARGB32);
     img.fill(0);
 
-    float min_v = sinogram.data[0][0];
-    float max_v = sinogram.data[0][0];
+    float min_v = std::numeric_limits<float>::max();
+    float max_v = std::numeric_limits<float>::lowest();
     
     #pragma omp parallel for reduction(min:min_v) reduction(max:max_v)
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            const float v = sinogram.data[y][x];
+    for (int a = 0; a < num_angles; ++a) {
+        const float* row = sinogram.data[static_cast<size_t>(a)];
+        for (int i = 0; i < num_bins; ++i) {
+            const float v = row[i];
             if (v < min_v) min_v = v;
             if (v > max_v) max_v = v;
         }
@@ -359,14 +364,16 @@ QImage CtReconstructionController::sinogramToImage(const ct::Sinogram& sinogram)
     const int bytes_per_line = img.bytesPerLine();
     uchar* bits = img.bits();
 
+    // Map [Angle][Bin] to UI Image(x=Angle, y=Bin)
     #pragma omp parallel for
-    for (int y = 0; y < height; ++y) {
-        uchar* rowPtr = bits + y * bytes_per_line;
-        for (int x = 0; x < width; ++x) {
-            const float v = sinogram.data[static_cast<size_t>(height - 1 - y)][static_cast<size_t>(x)];
+    for (int i = 0; i < num_bins; ++i) {
+        uchar* rowPtr = bits + (num_bins - 1 - i) * bytes_per_line;
+        QRgb* lineRgb = reinterpret_cast<QRgb*>(rowPtr);
+        for (int a = 0; a < num_angles; ++a) {
+            const float v = sinogram.data[static_cast<size_t>(a)][static_cast<size_t>(i)];
             const float n = ct::utils::clamp((v - min_v) * inv_span, 0.0f, 1.0f);
             const int c = static_cast<int>(n * 255.0f);
-            reinterpret_cast<QRgb*>(rowPtr)[x] = qRgb(c, c, c);
+            lineRgb[a] = qRgb(c, c, c);
         }
     }
 
