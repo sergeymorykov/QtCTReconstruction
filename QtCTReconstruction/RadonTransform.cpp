@@ -32,6 +32,7 @@ Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, co
     // Angle Batching: Process a group of angles for each pixel to maximize 
     // memory bandwidth and CPU instruction throughput (similar to backprojection).
     const int batch_size = 16;
+    #pragma omp parallel for schedule(static)
     for (int b_start = 0; b_start < na; b_start += batch_size) {
         int b_count = std::min(batch_size, na - b_start);
         
@@ -83,6 +84,7 @@ Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, co
 
     // Final result in standard layout: [Bin][Angle]
     sino.data.assign(num_angles, detector_bins, 0.0f);
+    #pragma omp parallel for schedule(static)
     for (int a = 0; a < na; ++a) {
         const float* src_row = local_sino[static_cast<size_t>(a)];
         for (int i = 0; i < db; ++i) {
