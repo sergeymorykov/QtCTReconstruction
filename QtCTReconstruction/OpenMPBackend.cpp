@@ -95,6 +95,7 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
     const auto filter = FilterDesign::createFilter(projection_size_padded, params.filter);
 
     const size_t spectrum_size = projection_size_padded / 2 + 1;
+    const int nthreads = omp_get_max_threads();
     std::vector<std::vector<float>> thread_proj(nthreads, std::vector<float>(projection_size_padded, 0.0f));
     std::vector<std::vector<Complex>> thread_spectrum(nthreads, std::vector<Complex>(spectrum_size));
     std::vector<std::vector<float>> thread_q(nthreads, std::vector<float>(projection_size_padded));
