@@ -38,6 +38,7 @@ set(SOURCES
     QtCTReconstruction/BackendFactory.cpp
     QtCTReconstruction/OpenMPBackend.cpp
     QtCTReconstruction/CUDABackend.cu
+    QtCTReconstruction/CUDAPureBackend.cu
     QtCTReconstruction/PointCloudGeometry.cpp
     QtCTReconstruction/OptimizedBackprojectionCPU.cpp
     QtCTReconstruction/ProjectionGeometry.cpp
