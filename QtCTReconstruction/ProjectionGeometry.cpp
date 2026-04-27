@@ -16,8 +16,8 @@ std::vector<ProjectionMatrix> ProjectionGeometry::createParallelBeamMatrices(
     float cy = (geom.ny - 1) * 0.5f;
     float cz = (geom.nz - 1) * 0.5f;
 
-    float det_cx = static_cast<float>(geom.nw / 2);
-    float det_cy = static_cast<float>(geom.nh / 2);
+    float det_cx = (geom.nw - 1) * 0.5f;
+    float det_cy = (geom.nh - 1) * 0.5f;
 
     // Parallel beam matrix components (matching CUDABackend logic)
     // u = ( (x-cx)*cos - (y-cy)*sin ) / pixel_size + det_cx

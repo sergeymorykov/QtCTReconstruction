@@ -38,6 +38,7 @@ set(SOURCES
     QtCTReconstruction/BackendFactory.cpp
     QtCTReconstruction/OpenMPBackend.cpp
     QtCTReconstruction/CUDABackend.cu
+    QtCTReconstruction/CUDAPureBackend.cu
     QtCTReconstruction/PointCloudGeometry.cpp
     QtCTReconstruction/OptimizedBackprojectionCPU.cpp
     QtCTReconstruction/ProjectionGeometry.cpp
@@ -74,13 +75,6 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>
         $<$<COMPILE_LANGUAGE:CXX>:/openmp:experimental>
         $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
-        $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>
-        $<$<COMPILE_LANGUAGE:CXX>:/fp:fast>
-        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/O2>
-        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/GL>
-    )
-    target_link_options(${PROJECT_NAME} PRIVATE
-        $<$<CONFIG:Release>:/LTCG>
     )
 endif()
 

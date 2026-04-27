@@ -101,18 +101,12 @@ struct Buffer3D {
     float& at(size_t x, size_t y, size_t z) { return data[(z * height + y) * width + x]; }
     const float& at(size_t x, size_t y, size_t z) const { return data[(z * height + y) * width + x]; }
 
-    // Получить срез (z) - создает копию (медленно)
+    // Получить срез (z)
     Buffer2D getSlice(size_t z) const {
         if (z >= depth) return Buffer2D();
         Buffer2D slice(width, height);
         std::copy(data.begin() + z * width * height, data.begin() + (z + 1) * width * height, slice.data.begin());
         return slice;
-    }
-
-    // Получить указатель на срез (z) - без копирования (быстро)
-    const float* getSlicePtr(size_t z) const {
-        if (z >= depth) return nullptr;
-        return &data[z * width * height];
     }
     
     void setSlice(size_t z, const Buffer2D& slice) {
@@ -135,7 +129,7 @@ struct Point {
 using PointCloud = std::vector<Point>;
 
 struct Sinogram {
-    Buffer2D data; // Optimized Layout: [angle][bin] (width = detector_bins, height = num_angles)
+    Buffer2D data; // width = num_angles, height = detector_bins
     std::vector<float> angles_deg;
     float detector_spacing_mm = 1.0f;
     float original_min_hu = 0.0f;

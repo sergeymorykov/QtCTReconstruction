@@ -82,7 +82,7 @@ Window {
 
             Label { text: "Backend:"; color: "white" }
             ComboBox {
-                model: ["OpenMP (CPU)", "CUDA (GPU)"]
+                model: ["OpenMP (CPU)", "CUDA (GPU+CPU)", "CUDA Pure (Full-GPU)"]
                 currentIndex: controller.backendType
                 onCurrentIndexChanged: {
                     console.log("Selected backend:", currentIndex);
