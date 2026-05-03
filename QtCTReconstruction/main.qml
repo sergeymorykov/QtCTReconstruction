@@ -82,13 +82,28 @@ Window {
 
             Label { text: "Backend:"; color: "white" }
             ComboBox {
-                model: ["OpenMP (CPU)", "CUDA (GPU+CPU)", "CUDA Pure (Full-GPU)"]
-                currentIndex: controller.backendType
+                id: backendCombo
+                // Serial (index 0) — однопоточный эталон для регрессионных тестов,
+                // доступен только в Debug-сборке (как кнопка "3D Cloud Viewer").
+                // Значения model[] соответствуют BackendType enum:
+                //   Serial=0, OpenMP=1, CUDA=2, CUDAPure=3
+                model: controller.isDebugBuild
+                    ? ["Serial (1-thread)", "OpenMP (CPU)", "CUDA (GPU+CPU)", "CUDA Pure (Full-GPU)"]
+                    : ["OpenMP (CPU)", "CUDA (GPU+CPU)", "CUDA Pure (Full-GPU)"]
+
+                // При использовании debug-списка индекс UI == значение enum.
+                // В release-списке Serial нет, поэтому офсет = 1 (Serial пропускаем).
+                readonly property int enumOffset: controller.isDebugBuild ? 0 : 1
+
+                currentIndex: controller.backendType - enumOffset
+
                 onCurrentIndexChanged: {
-                    console.log("Selected backend:", currentIndex);
-                    controller.backendType = currentIndex;
+                    const enumVal = currentIndex + enumOffset;
+                    if (controller.backendType !== enumVal) {
+                        controller.backendType = enumVal;
+                    }
                 }
-                implicitWidth: 150
+                implicitWidth: 185
             }
 
             Label { text: "Filter:"; color: "white" }

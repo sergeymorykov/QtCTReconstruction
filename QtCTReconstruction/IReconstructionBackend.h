@@ -35,12 +35,16 @@ public:
 
     // Время последнего этапа проецирования (мс)
     virtual double lastSinogramTimeMs() const = 0;
+
+    // Время последнего этапа FBP-реконструкции (мс).
+    // Default 0: переопределяется в бэкендах, где этапы измеряются раздельно.
+    virtual double lastReconstructionTimeMs() const { return 0.0; }
 };
 
 // Простая фабрика для получения бэкендов
 class BackendFactory {
 public:
-    enum class BackendType { OpenMP, CUDA, CUDAPure };
+    enum class BackendType { Serial, OpenMP, CUDA, CUDAPure };
 
     static std::shared_ptr<IReconstructionBackend> create(BackendType type);
     static std::shared_ptr<IReconstructionBackend> createBestAvailable();

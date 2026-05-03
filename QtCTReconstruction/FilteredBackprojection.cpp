@@ -1,6 +1,6 @@
 #include "FilteredBackprojection.h"
 
-#include "FFT.h"
+#include "IFFTBackend.h"       // thread-local FFT-бэкенд (Builtin или FFTW3)
 #include "FilterDesign.h"
 #include "Utils.h"
 
@@ -48,41 +48,43 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
     const size_t padding_factor = 2;
     const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
     const auto filter = FilterDesign::createFilter(projection_size_padded, params.filter);
-
-    const int nthreads = omp_get_max_threads();
-    const size_t spectrum_size = projection_size_padded / 2 + 1;
-    
-    std::vector<std::vector<float>> thread_proj_padded(nthreads, std::vector<float>(projection_size_padded, 0.0f));
-    std::vector<std::vector<Complex>> thread_spectrum(nthreads, std::vector<Complex>(spectrum_size));
-    std::vector<std::vector<float>> thread_q(nthreads, std::vector<float>(projection_size_padded));
+    const size_t spectrum_size = projection_size_padded / 2 + 1;  // n/2+1 комплексных точек
 
     Buffer2D filtered(square_bins, num_angles, 0.0f); // width = bins, height = angles
     const int na = static_cast<int>(num_angles);
-    
-    #pragma omp parallel for schedule(dynamic)
-    for (int a = 0; a < na; ++a) {
-        const int tid = omp_get_thread_num();
-        auto& proj_padded = thread_proj_padded[tid];
-        auto& spectrum = thread_spectrum[tid];
-        auto& q = thread_q[tid];
 
-        std::fill(proj_padded.begin(), proj_padded.end(), 0.0f);
-        const float* src_row = sino_square[static_cast<size_t>(a)];
-        for (size_t i = 0; i < square_bins; ++i) {
-            proj_padded[i] = src_row[i];
-        }
+    // [P2] Thread-local FFT-план: каждый поток получает собственный IFFTBackend.
+    // prepare() вызывается один раз при входе в parallel-регион (или при смене fft_size).
+    // Буферы proj_padded/spectrum/q также локальны — нет конкуренции за память.
+    #pragma omp parallel
+    {
+        IFFTBackend& fft = IFFTBackend::threadLocal();
+        fft.prepare(projection_size_padded); // no-op если размер не изменился
 
-        FFT::forwardReal(proj_padded, spectrum);
-        for (size_t k = 0; k < spectrum_size; ++k) {
-            spectrum[k] *= filter[k];
+        std::vector<float>   proj_padded(projection_size_padded, 0.0f);
+        std::vector<Complex> spectrum(spectrum_size);
+        std::vector<float>   q(projection_size_padded);
+
+        #pragma omp for schedule(dynamic)
+        for (int a = 0; a < na; ++a) {
+            std::fill(proj_padded.begin(), proj_padded.end(), 0.0f);
+            const float* src_row = sino_square[static_cast<size_t>(a)];
+            for (size_t i = 0; i < square_bins; ++i) {
+                proj_padded[i] = src_row[i];
+            }
+
+            fft.forwardReal(proj_padded, spectrum);
+            for (size_t k = 0; k < spectrum_size; ++k) {
+                spectrum[k] *= filter[k];
+            }
+            fft.inverseReal(spectrum, q);
+
+            float* dst_row = filtered[static_cast<size_t>(a)];
+            for (size_t i = 0; i < square_bins; ++i) {
+                dst_row[i] = q[i];
+            }
         }
-        FFT::inverseReal(spectrum, q);
-        
-        float* dst_row = filtered[static_cast<size_t>(a)];
-        for (size_t i = 0; i < square_bins; ++i) {
-            dst_row[i] = q[i];
-        }
-    }
+    } // end parallel
 
     Slice recon(output_size, output_size, 0.0f);
     const float radius = static_cast<float>(output_size / 2);

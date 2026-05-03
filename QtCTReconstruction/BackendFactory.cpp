@@ -1,4 +1,7 @@
 #include "IReconstructionBackend.h"
+#ifdef CT_HAS_SERIAL_BACKEND
+#include "SerialBackend.h"
+#endif
 #include "OpenMPBackend.h"
 #include "CUDABackend.h"
 #include "CUDAPureBackend.h"
@@ -6,6 +9,11 @@
 namespace ct {
 
 std::shared_ptr<IReconstructionBackend> BackendFactory::create(BackendType type) {
+#ifdef CT_HAS_SERIAL_BACKEND
+    if (type == BackendType::Serial) {
+        return std::make_shared<SerialBackend>();
+    } else
+#endif
     if (type == BackendType::OpenMP) {
         return std::make_shared<OpenMPBackend>();
     } else if (type == BackendType::CUDA) {

@@ -141,7 +141,7 @@ private:
     ImageVec m_differenceImagesPtr;
 
     int m_filterType = 1; // SheppLogan
-    int m_backendType = 0; // OpenCV/CUDA switch
+    int m_backendType = 1; // 0=Serial,1=OpenMP,2=CUDA,3=CUDAPure (см. BackendFactory::BackendType)
     bool m_asBuffer = true;
     int m_volumeSize = 1024;
 

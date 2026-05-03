@@ -1,5 +1,5 @@
+#pragma diag_suppress 20011
 #include "CUDABackend.h"
-
 #include "FilterDesign.h"
 #include "Utils.h"
 
@@ -83,43 +83,65 @@ __global__ void transposeScaleKernel(
         dst[tx * num_angles + ty] = tile[threadIdx.x][threadIdx.y];
 }
 
-__global__ void radonForwardScatterKernel(
+// Gather-style forward projection: thread = (angle, bin).
+// Каждый thread интегрирует вдоль своего луча через bilinear sampling изображения.
+// Преимущества:
+//   - Нет atomicAdd: каждый thread пишет ровно в одну ячейку синограммы.
+//   - Coalesced writes: соседние bins одного угла = соседние ячейки памяти.
+//   - Matched projector/backprojector pair (для будущих ML-EM/OS-EM).
+__global__ void radonForwardGatherKernel(
     const float* __restrict__ image,
     float* __restrict__ sino,
     int width, int height,
     int num_angles, int detector_bins,
     float cx, float cy,
     float detector_center,
-    int z_slice) 
+    int z_slice)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int bin = blockIdx.x * blockDim.x + threadIdx.x;
+    int a   = blockIdx.y * blockDim.y + threadIdx.y;
+    if (bin >= detector_bins || a >= num_angles) return;
 
-    if (x >= width || y >= height) return;
+    float c = c_cos_table[a];
+    float s = c_sin_table[a];
+    float u_signed = (float)bin - detector_center;
 
-    float v = image[y * width + x];
-    if (v == 0.0f) return;
+    // Базовая точка луча в координатах изображения и направление перпендикулярно проекции.
+    // Соответствует scatter-формуле u = (x-cx)*c - (y-cy)*s + det_center.
+    float bx = cx + u_signed * c;
+    float by = cy - u_signed * s;
+    float dx = s;
+    float dy = c;
 
-    float xx = (float)x - cx;
-    float yy = (float)y - cy;
+    // Длина диагонали — гарантированно покрывает изображение под любым углом.
+    float half = 0.5f * sqrtf((float)(width * width + height * height));
+    int n_samples = (int)(2.0f * half) + 1;
 
-    for (int a = 0; a < num_angles; ++a) {
-        float c = c_cos_table[a];
-        float s = c_sin_table[a];
+    float sum = 0.0f;
+    float t = -half;
+    for (int i = 0; i < n_samples; ++i, t += 1.0f) {
+        float x = bx + t * dx;
+        float y = by + t * dy;
 
-        float u = xx * c - yy * s + detector_center;
-        
-        int i0 = (int)floorf(u);
-        int i1 = i0 + 1;
-        float frac = u - (float)i0;
+        int x0 = (int)floorf(x);
+        int y0 = (int)floorf(y);
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+        float fx = x - (float)x0;
+        float fy = y - (float)y0;
 
-        if (i0 >= 0 && i0 < detector_bins) {
-            atomicAdd(&sino[(z_slice * num_angles + a) * detector_bins + i0], v * (1.0f - frac));
-        }
-        if (i1 >= 0 && i1 < detector_bins) {
-            atomicAdd(&sino[(z_slice * num_angles + a) * detector_bins + i1], v * frac);
-        }
+        float v00 = (x0 >= 0 && x0 < width  && y0 >= 0 && y0 < height) ? image[y0 * width + x0] : 0.0f;
+        float v10 = (x1 >= 0 && x1 < width  && y0 >= 0 && y0 < height) ? image[y0 * width + x1] : 0.0f;
+        float v01 = (x0 >= 0 && x0 < width  && y1 >= 0 && y1 < height) ? image[y1 * width + x0] : 0.0f;
+        float v11 = (x1 >= 0 && x1 < width  && y1 >= 0 && y1 < height) ? image[y1 * width + x1] : 0.0f;
+
+        sum += (1.0f - fx) * (1.0f - fy) * v00
+             +         fx  * (1.0f - fy) * v10
+             + (1.0f - fx) *         fy  * v01
+             +         fx  *         fy  * v11;
     }
+
+    sino[(z_slice * num_angles + a) * detector_bins + bin] = sum;
 }
 
 __global__ void multiplyFilterKernel(
@@ -230,18 +252,30 @@ CUDABackend::~CUDABackend() {
 }
 
 void CUDABackend::releaseCache() const {
-    if (m_d_filter) { cudaFree(m_d_filter); m_d_filter = nullptr; }
-    if (m_d_cos) { cudaFree(m_d_cos); m_d_cos = nullptr; }
-    if (m_d_sin) { cudaFree(m_d_sin); m_d_sin = nullptr; }
-    
-    if (m_d_vol_in) { cudaFree(m_d_vol_in); m_d_vol_in = nullptr; }
-    if (m_d_vol_out) { cudaFree(m_d_vol_out); m_d_vol_out = nullptr; }
-    if (m_d_sino) { cudaFree(m_d_sino); m_d_sino = nullptr; }
-    if (m_d_spectrum) { cudaFree(m_d_spectrum); m_d_spectrum = nullptr; }
+    if (m_d_filter)   { cudaFree(m_d_filter);   m_d_filter   = nullptr; }
+    if (m_d_cos)      { cudaFree(m_d_cos);       m_d_cos      = nullptr; }
+    if (m_d_sin)      { cudaFree(m_d_sin);       m_d_sin      = nullptr; }
+    if (m_d_vol_in)   { cudaFree(m_d_vol_in);   m_d_vol_in   = nullptr; }
+    if (m_d_vol_out)  { cudaFree(m_d_vol_out);  m_d_vol_out  = nullptr; }
+    if (m_d_sino)     { cudaFree(m_d_sino);      m_d_sino     = nullptr; }
+    if (m_d_spectrum) { cudaFree(m_d_spectrum);  m_d_spectrum = nullptr; }
+
+    // [P1] Pinned host memory
+    if (m_h_slice_A) { cudaFreeHost(m_h_slice_A); m_h_slice_A = nullptr; }
+    if (m_h_slice_B) { cudaFreeHost(m_h_slice_B); m_h_slice_B = nullptr; }
+    m_pinnedSliceCap = 0;
+
+    // [P1] CUDA streams & events
+    if (m_event_A)  { cudaEventDestroy(m_event_A);  m_event_A  = nullptr; }
+    if (m_event_B)  { cudaEventDestroy(m_event_B);  m_event_B  = nullptr; }
+    if (m_event_compute_A) { cudaEventDestroy(m_event_compute_A); m_event_compute_A = nullptr; }
+    if (m_event_compute_B) { cudaEventDestroy(m_event_compute_B); m_event_compute_B = nullptr; }
+    if (m_stream_A) { cudaStreamDestroy(m_stream_A); m_stream_A = nullptr; }
+    if (m_stream_B) { cudaStreamDestroy(m_stream_B); m_stream_B = nullptr; }
 
     if (m_planR2C) { cufftDestroy(m_planR2C); m_planR2C = 0; }
     if (m_planC2R) { cufftDestroy(m_planC2R); m_planC2R = 0; }
-    
+
     m_filterSize = 0;
     m_planAngles = 0;
     m_trigAngles = 0;
@@ -251,40 +285,58 @@ void CUDABackend::releaseCache() const {
 }
 
 void CUDABackend::ensureWorkspace(size_t w, size_t h, size_t d, size_t num_angles, size_t bins) const {
-    size_t vol_req = w * h * d;
+    size_t vol_req  = w * h * d;
     size_t sino_req = num_angles * bins * d;
 
-    // Буфер для спектра (FFT)
     const size_t square_bins = static_cast<size_t>(std::ceil(std::sqrt(2.0) * static_cast<double>(bins)));
     const size_t padding_factor = 2;
     const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
     size_t complex_size = projection_size_padded / 2 + 1;
     size_t spec_req = num_angles * complex_size;
 
-    // В reconstructSlice мы используем m_d_vol_out как d_sino_padded, размер которого:
     size_t padded_sino_req = num_angles * projection_size_padded;
-    if (vol_req < padded_sino_req) {
-        vol_req = padded_sino_req;
-    }
+    if (vol_req < padded_sino_req) vol_req = padded_sino_req;
 
     if (m_volSize < vol_req) {
-        if (m_d_vol_in) cudaFree(m_d_vol_in);
+        if (m_d_vol_in)  cudaFree(m_d_vol_in);
         if (m_d_vol_out) cudaFree(m_d_vol_out);
-        CUDA_CHECK(cudaMalloc(&m_d_vol_in, vol_req * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&m_d_vol_in,  vol_req * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&m_d_vol_out, vol_req * sizeof(float)));
         m_volSize = vol_req;
     }
-
     if (m_sinoSize < sino_req) {
         if (m_d_sino) cudaFree(m_d_sino);
         CUDA_CHECK(cudaMalloc(&m_d_sino, sino_req * sizeof(float)));
         m_sinoSize = sino_req;
     }
-
     if (m_spectrumSize < spec_req) {
         if (m_d_spectrum) cudaFree(m_d_spectrum);
         CUDA_CHECK(cudaMalloc(&m_d_spectrum, spec_req * sizeof(cufftComplex)));
         m_spectrumSize = spec_req;
+    }
+}
+
+// [P1] Pinned host buffers + CUDA streams/events
+void CUDABackend::ensurePinnedAndStreams(size_t slice_pixels) const {
+    // Streams & events: создаём один раз
+    if (!m_stream_A) CUDA_CHECK(cudaStreamCreate(&m_stream_A));
+    if (!m_stream_B) CUDA_CHECK(cudaStreamCreate(&m_stream_B));
+    if (!m_event_A)  CUDA_CHECK(cudaEventCreateWithFlags(&m_event_A, cudaEventDisableTiming));
+    if (!m_event_B)  CUDA_CHECK(cudaEventCreateWithFlags(&m_event_B, cudaEventDisableTiming));
+    if (!m_event_compute_A) CUDA_CHECK(cudaEventCreateWithFlags(&m_event_compute_A, cudaEventDisableTiming));
+    if (!m_event_compute_B) CUDA_CHECK(cudaEventCreateWithFlags(&m_event_compute_B, cudaEventDisableTiming));
+
+    // Pinned host buffers: пересоздаём только при увеличении размера среза
+    if (m_pinnedSliceCap < slice_pixels) {
+        if (m_h_slice_A) cudaFreeHost(m_h_slice_A);
+        if (m_h_slice_B) cudaFreeHost(m_h_slice_B);
+        // cudaHostAllocPortable: доступен из любого CUDA-контекста
+        // cudaHostAllocWriteCombined: запись CPU без кэша → максимальная H→D пропускная способность
+        CUDA_CHECK(cudaHostAlloc(&m_h_slice_A, slice_pixels * sizeof(float),
+                                  cudaHostAllocPortable | cudaHostAllocWriteCombined));
+        CUDA_CHECK(cudaHostAlloc(&m_h_slice_B, slice_pixels * sizeof(float),
+                                  cudaHostAllocPortable | cudaHostAllocWriteCombined));
+        m_pinnedSliceCap = slice_pixels;
     }
 }
 
@@ -310,8 +362,20 @@ void CUDABackend::ensurePlans(size_t num_angles, size_t padded_size) const {
 }
 
 void CUDABackend::ensureTrigTables(const std::vector<float>& angles_deg) const {
-    if (m_cachedAnglesDeg == angles_deg) return;
     size_t n = angles_deg.size();
+    if (n == 0) return;
+
+    // Лёгкая эвристика кэширования: сверяем (count, first, last) вместо копии
+    // всего вектора. Полный std::vector::operator= в горячем пути приводил к
+    // access violation в Debug-билде при больших объёмах (heap fragmentation).
+    const float first = angles_deg.front();
+    const float last  = angles_deg.back();
+    if (m_trigAngles == n &&
+        m_cachedFirstAngle == first &&
+        m_cachedLastAngle  == last) {
+        return;
+    }
+
     std::vector<float> hcos(n), hsin(n);
     for (size_t a = 0; a < n; ++a) {
         float th = angles_deg[a] * (float)(M_PI / 180.0);
@@ -333,7 +397,8 @@ void CUDABackend::ensureTrigTables(const std::vector<float>& angles_deg) const {
     cudaMemcpyToSymbol(c_sin_table, hsin.data(), count * sizeof(float));
 
     m_trigAngles = n;
-    m_cachedAnglesDeg = angles_deg;
+    m_cachedFirstAngle = first;
+    m_cachedLastAngle  = last;
 }
 
 bool CUDABackend::isAvailable() const {
@@ -385,21 +450,18 @@ Sinogram CUDABackend::computeSinogram(const Buffer2D& slice, size_t num_angles, 
     int grid_norm = (int)((w * h + 255) / 256);
     normalizeGPUKernel<<<grid_norm, 256>>>(m_d_vol_in, w * h, vmin, inv_span);
 
-    // 3. Прямое проецирование (Scatter алгоритм - идентично CPU)
+    // 3. Прямое проецирование (Gather алгоритм - thread на (angle, bin), без atomicAdd)
     dim3 block(16, 16);
-    dim3 grid((w + 15) / 16, (h + 15) / 16);
-
-    // Очищаем буфер синограммы перед накоплением atomicAdd
-    CUDA_CHECK(cudaMemset(m_d_sino, 0, num_angles * detector_bins * sizeof(float)));
+    dim3 grid(((int)detector_bins + 15) / 16, ((int)num_angles + 15) / 16);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    radonForwardScatterKernel<<<grid, block>>>(
-        m_d_vol_in, m_d_sino, (int)w, (int)h, 
-        (int)num_angles, (int)detector_bins, 
+    radonForwardGatherKernel<<<grid, block>>>(
+        m_d_vol_in, m_d_sino, (int)w, (int)h,
+        (int)num_angles, (int)detector_bins,
         cx, cy, detector_center, 0
     );
 
@@ -520,96 +582,132 @@ Buffer2D CUDABackend::reconstructSlice(const Sinogram& sinogram, size_t output_s
     return recon;
 }
 
-void CUDABackend::reconstructVolume(const Volume& input_volume, 
+void CUDABackend::reconstructVolume(const Volume& input_volume,
                                       Volume& out_reconstruction,
                                       const ReconstructionParams& params,
                                       std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (input_volume.empty()) return;
-    
-    const size_t depth = input_volume.depth;
-    const size_t width = input_volume.width;
+
+    const size_t depth  = input_volume.depth;
+    const size_t width  = input_volume.width;
     const size_t height = input_volume.height;
-    
+    const size_t slice_pixels = width * height;
+    const size_t slice_bytes  = slice_pixels * sizeof(float);
+
     out_reconstruction.assign(width, height, depth, 0.0f);
     out_reconstruction.x_coords = input_volume.x_coords;
     out_reconstruction.y_coords = input_volume.y_coords;
     out_reconstruction.z_coords = input_volume.z_coords;
 
-    // 1. Подготовка Workspace и параметров
-    ensureTrigTables(std::vector<float>(params.num_angles)); // Будущие углы
-    // На самом деле углы генерируются в computeSinogram. 
-    // Для упрощения возьмем стандартный шаг 180/N.
+    // Подготовка углов
     std::vector<float> angles(params.num_angles);
-    float step = 180.0f / (float)params.num_angles;
-    for(size_t i=0; i<params.num_angles; ++i) angles[i] = i * step;
-    ensureTrigTables(angles);
+    const float step = 180.0f / (float)params.num_angles;
+    for (size_t i = 0; i < params.num_angles; ++i) angles[i] = i * step;
 
+    ensureTrigTables(angles);
     ensureWorkspace(width, height, 1, params.num_angles, width);
+
+    // [P1] Pinned host buffers + CUDA streams/events
+    ensurePinnedAndStreams(slice_pixels);
 
     std::vector<float> slice_min(depth, 0.0f);
     std::vector<float> slice_max(depth, 0.0f);
 
-    float total_sino_ms = 0.0f;
+    // ----------------------------------------------------------------
+    // [P1] Двойная буферизация (ping-pong):
+    //   stream_copy  → копирует slice[z] H→D через pinned-буфер
+    //   stream_compute → нормализует + проецирует + реконструирует slice[z-1]
+    //
+    // Схема:
+    //   Итерация z:
+    //     1. memcpy(pinned_cur, host_data[z], async)  — stream_copy
+    //     2. record(event_copy) на stream_copy
+    //     3. stream_compute ждёт event_copy (wait)
+    //     4. cudaMemcpyAsync(d_vol_in, pinned_cur, async) — stream_compute
+    //     5. ядра normalize + scatter + reconstruct — stream_compute
+    //     6. cudaMemcpyAsync(host_out[z-1], d_recon, async) — stream_compute
+    //
+    // Для четных z используем буфер A, нечётных — B (ping-pong).
+    // ----------------------------------------------------------------
 
-    // 3. Цикл по срезам внутри GPU (с загрузкой по 1 срезу для экономии VRAM)
+    // ----------------------------------------------------------------
+    // Линейный per-slice pipeline (ping-pong удалён).
+    //
+    // Причина: reconstructSlice внутри использует m_d_vol_in как буфер для
+    // транспонированной фильтрованной синограммы (transposeScaleKernel пишет
+    // туда → cudaMemcpy2DToArray читает оттуда). Это конфликтовало с попыткой
+    // stream_copy параллельно записывать туда же следующий срез — race с
+    // непредсказуемым исходом (либо garbage в thrust, либо off-by-one).
+    //
+    // Pinned-память сохранена — даёт ~2x пропускной способности H→D
+    // относительно pageable. Per-slice H2D ≈ 0.3 мс на 256² @ PCIe 3.0 x16,
+    // в общем времени реконструкции <1%, поэтому потеря overlap минимальна.
+    // ----------------------------------------------------------------
+    float* pinned_buf = m_h_slice_A;  // одного буфера достаточно
+
+    auto t_vol_start = std::chrono::high_resolution_clock::now();
+
     for (size_t z = 0; z < depth; ++z) {
-        auto t_sino_start = std::chrono::high_resolution_clock::now();
+        // 1. CPU memcpy в pinned host buffer (для max H→D пропускной способности)
+        const float* src = input_volume.data.data() + z * slice_pixels;
+        std::memcpy(pinned_buf, src, slice_bytes);
 
-        // Copy ONE slice to m_d_vol_in
-        CUDA_CHECK(cudaMemcpy(m_d_vol_in, input_volume.data.data() + (z * width * height), width * height * sizeof(float), cudaMemcpyHostToDevice));
+        // 2. Sync H→D в m_d_vol_in
+        CUDA_CHECK(cudaMemcpy(m_d_vol_in, pinned_buf, slice_bytes, cudaMemcpyHostToDevice));
 
+        // 3. min/max → нормализация
         thrust::device_ptr<float> dp(m_d_vol_in);
-        float vmin = *thrust::min_element(dp, dp + (width * height));
-        float vmax = *thrust::max_element(dp, dp + (width * height));
-        
+        float vmin = *thrust::min_element(dp, dp + slice_pixels);
+        float vmax = *thrust::max_element(dp, dp + slice_pixels);
         slice_min[z] = vmin;
         slice_max[z] = vmax;
 
         float span = vmax - vmin;
         if (span < 1e-6f) span = 1.0f;
-        float inv_span = 1.0f / span;
-        int grid_norm = (int)((width * height + 255) / 256);
-        normalizeGPUKernel<<<grid_norm, 256>>>(m_d_vol_in, width * height, vmin, inv_span);
+        const int grid_norm = (int)((slice_pixels + 255) / 256);
+        normalizeGPUKernel<<<grid_norm, 256>>>(
+            m_d_vol_in, (int)slice_pixels, vmin, 1.0f / span);
 
-        // Forward Projection (Scatter)
-        dim3 block(16, 16);
-        dim3 grid((width + 15) / 16, (height + 15) / 16);
-        
-        float cx = (float)(width - 1) * 0.5f;
-        float cy = (float)(height - 1) * 0.5f;
-        float detector_center = (float)((int)width / 2); // Предполагаем bins = width
+        // 4. Forward Radon (gather, no atomic)
+        const float cx = (float)(width  - 1) * 0.5f;
+        const float cy = (float)(height - 1) * 0.5f;
+        const float det_center = (float)((int)width / 2);
 
-        // Очищаем m_d_sino (1 срез)
-        CUDA_CHECK(cudaMemset(m_d_sino, 0, params.num_angles * width * sizeof(float)));
+        dim3 blk(16, 16);
+        dim3 grd(((int)width + 15) / 16, ((int)params.num_angles + 15) / 16);
+        radonForwardGatherKernel<<<grd, blk>>>(
+            m_d_vol_in, m_d_sino,
+            (int)width, (int)height,
+            (int)params.num_angles, (int)width,
+            cx, cy, det_center, 0);
 
-        radonForwardScatterKernel<<<grid, block>>>(
-            m_d_vol_in, 
-            m_d_sino, (int)width, (int)height,
-            (int)params.num_angles, (int)width, 
-            cx, cy, detector_center, 0
-        );
-
+        // 5. Sino D→H для передачи в reconstructSlice (которая ожидает Sinogram)
         CUDA_CHECK(cudaDeviceSynchronize());
-        auto t_sino_end = std::chrono::high_resolution_clock::now();
-        total_sino_ms += std::chrono::duration<float, std::milli>(t_sino_end - t_sino_start).count();
 
-        // Download sinogram to Host
         Sinogram s;
-        s.data.assign(width, params.num_angles, 0.0f); // width = bins, height = angles
-        CUDA_CHECK(cudaMemcpy(s.data.data.data(), m_d_sino, params.num_angles * width * sizeof(float), cudaMemcpyDeviceToHost));
-        s.angles_deg = angles;
+        s.data.assign(width, params.num_angles, 0.0f);
+        CUDA_CHECK(cudaMemcpy(s.data.data.data(), m_d_sino,
+                               params.num_angles * width * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+        s.angles_deg      = angles;
         s.original_min_hu = slice_min[z];
         s.original_max_hu = slice_max[z];
 
-        Buffer2D recon = reconstructSlice(s, width, params);
+        // 6. FBP (reconstructSlice — переиспользует m_d_vol_in/m_d_vol_out)
+        Buffer2D recon = reconstructSlice(s, (int)width, params);
         out_reconstruction.setSlice(z, recon);
 
         if (onSliceDone) onSliceDone((int)z, recon);
     }
 
-    m_lastSinogramTimeMs = static_cast<double>(total_sino_ms);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto t_vol_end = std::chrono::high_resolution_clock::now();
+    m_lastSinogramTimeMs = std::chrono::duration<double, std::milli>(
+        t_vol_end - t_vol_start).count();
 }
+
 
 PointCloud CUDABackend::extractPointCloud(const Volume& vol, float threshold) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);

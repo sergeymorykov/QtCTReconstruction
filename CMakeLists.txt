@@ -42,9 +42,91 @@ set(SOURCES
     QtCTReconstruction/PointCloudGeometry.cpp
     QtCTReconstruction/OptimizedBackprojectionCPU.cpp
     QtCTReconstruction/ProjectionGeometry.cpp
+    # FFT абстракция (Sprint 1)
+    QtCTReconstruction/IFFTBackend.cpp
+    QtCTReconstruction/FFTBackendBuiltin.cpp
 )
 
+# ============================================================
+# FFT бэкенд (переключается через cmake -DFFT_BACKEND=Builtin|FFTW)
+# Builtin: учебный Cooley–Tukey (без внешних зависимостей)
+# FFTW:    FFTW3 single-precision (требует libfftw3f, ожидание x3-5)
+# ============================================================
+set(FFT_BACKEND "Builtin" CACHE STRING "FFT implementation: Builtin or FFTW")
+set_property(CACHE FFT_BACKEND PROPERTY STRINGS Builtin FFTW)
+
+if(FFT_BACKEND STREQUAL "FFTW")
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(FFTW3F fftw3f)
+    endif()
+    if(NOT FFTW3F_FOUND)
+        # Ручной поиск через find_library
+        find_library(FFTW3F_LIB NAMES fftw3f fftw3f-3 libfftw3f-3
+            HINTS 
+                "$ENV{FFTW_DIR}/lib"
+                "C:/fftw"
+                "C:/Program Files/fftw"
+        )
+        find_path(FFTW3F_INCLUDE_DIR NAMES fftw3.h
+            HINTS 
+                "$ENV{FFTW_DIR}/include"
+                "C:/fftw"
+                "C:/Program Files/fftw"
+        )
+        if(FFTW3F_LIB AND FFTW3F_INCLUDE_DIR)
+            set(FFTW3F_FOUND TRUE)
+            set(FFTW3F_LIBRARIES ${FFTW3F_LIB})
+            set(FFTW3F_INCLUDE_DIRS ${FFTW3F_INCLUDE_DIR})
+        endif()
+    endif()
+
+    if(FFTW3F_FOUND)
+        message(STATUS "[CT] FFT backend: FFTW3 (single precision)")
+        message(STATUS "[CT] FFTW3 include: ${FFTW3F_INCLUDE_DIRS}")
+        message(STATUS "[CT] FFTW3 lib:     ${FFTW3F_LIBRARIES}")
+    else()
+        message(WARNING "[CT] FFT_BACKEND=FFTW but fftw3f not found; falling back to Builtin")
+        set(FFT_BACKEND "Builtin" CACHE STRING "FFT implementation" FORCE)
+    endif()
+else()
+    message(STATUS "[CT] FFT backend: Builtin (Cooley-Tukey)")
+endif()
+
+# ============================================================
+# Serial backend (эталонная однопоточная реализация)
+# По умолчанию включён в Debug (для регрессионных тестов),
+# выключен в Release (не нужен в продакшн-сборке).
+# Переопределить: cmake -DBUILD_SERIAL_BACKEND=ON/OFF
+# ============================================================
+if(NOT DEFINED BUILD_SERIAL_BACKEND)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR NOT CMAKE_BUILD_TYPE)
+        set(BUILD_SERIAL_BACKEND ON CACHE BOOL "Build serial reference backend" FORCE)
+    else()
+        set(BUILD_SERIAL_BACKEND OFF CACHE BOOL "Build serial reference backend" FORCE)
+    endif()
+endif()
+
 qt_add_executable(${PROJECT_NAME} MANUAL_FINALIZATION ${SOURCES})
+
+# --- Зависимости, связываемые с FFT-бэкендом ---
+if(FFT_BACKEND STREQUAL "FFTW" AND FFTW3F_FOUND)
+    target_sources(${PROJECT_NAME} PRIVATE
+        QtCTReconstruction/FFTBackendFFTW.cpp
+    )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE CT_FFT_BACKEND_FFTW)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${FFTW3F_INCLUDE_DIRS})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${FFTW3F_LIBRARIES})
+endif()
+
+# --- Serial backend ---
+if(BUILD_SERIAL_BACKEND)
+    target_sources(${PROJECT_NAME} PRIVATE QtCTReconstruction/SerialBackend.cpp)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE CT_HAS_SERIAL_BACKEND)
+    message(STATUS "[CT] SerialBackend: ENABLED")
+else()
+    message(STATUS "[CT] SerialBackend: DISABLED (Release build)")
+endif()
 
 # Include directories
 target_include_directories(${PROJECT_NAME} PRIVATE QtCTReconstruction)

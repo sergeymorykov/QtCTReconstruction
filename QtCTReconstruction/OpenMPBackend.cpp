@@ -3,7 +3,7 @@
 #include "OptimizedBackprojectionCPU.h"
 #include "ProjectionGeometry.h"
 #include "FilteredBackprojection.h"
-#include "FFT.h"
+#include "IFFTBackend.h"       // thread-local FFT (Builtin или FFTW3)
 #include "FilterDesign.h"
 #include "Utils.h"
 #include "RadonTransform.h"
@@ -93,50 +93,52 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
     const size_t padding_factor = 2;
     const size_t projection_size_padded = std::max<size_t>(64, utils::nextPowerOfTwo(padding_factor * square_bins));
     const auto filter = FilterDesign::createFilter(projection_size_padded, params.filter);
-
     const size_t spectrum_size = projection_size_padded / 2 + 1;
-    const int nthreads = omp_get_max_threads();
-    std::vector<std::vector<float>> thread_proj(nthreads, std::vector<float>(projection_size_padded, 0.0f));
-    std::vector<std::vector<Complex>> thread_spectrum(nthreads, std::vector<Complex>(spectrum_size));
-    std::vector<std::vector<float>> thread_q(nthreads, std::vector<float>(projection_size_padded));
 
-    #pragma omp parallel for schedule(dynamic)
-    for (int z = 0; z < static_cast<int>(depth); ++z) {
-        const int tid = omp_get_thread_num();
-        auto& proj_padded = thread_proj[tid];
-        auto& spectrum = thread_spectrum[tid];
-        auto& q = thread_q[tid];
+    // [P2] Thread-local FFT-планы в параллельном регионе.
+    // Каждый поток вызывает IFFTBackend::threadLocal() и prepare() один раз.
+    // Буферы proj_padded/spectrum/q локальны потоку — нет конкуренции.
+    #pragma omp parallel
+    {
+        IFFTBackend& fft = IFFTBackend::threadLocal();
+        fft.prepare(projection_size_padded);
 
-        Buffer2D original_slice = input_volume.getSlice(z);
-        Sinogram sino = computeSinogram(original_slice, num_angles, detector_bins, false);
-        
-        min_hus[z] = sino.original_min_hu;
-        float s = sino.original_max_hu - sino.original_min_hu;
-        spans[z] = (s <= 0.0f) ? 1.0f : s;
+        std::vector<float>   proj_padded(projection_size_padded, 0.0f);
+        std::vector<Complex> spectrum(spectrum_size);
+        std::vector<float>   q(projection_size_padded);
 
-        // Filter this sinogram
-        for (size_t a = 0; a < num_angles; ++a) {
-            std::fill(proj_padded.begin(), proj_padded.end(), 0.0f);
-            for (size_t i = 0; i < detector_bins; ++i) {
-                size_t dst_idx = i + pad_before;
-                if (dst_idx < projection_size_padded) {
-                    proj_padded[dst_idx] = sino.data[a][i];
+        #pragma omp for schedule(dynamic)
+        for (int z = 0; z < static_cast<int>(depth); ++z) {
+            Buffer2D original_slice = input_volume.getSlice(z);
+            Sinogram sino = computeSinogram(original_slice, num_angles, detector_bins, false);
+
+            min_hus[z] = sino.original_min_hu;
+            float s = sino.original_max_hu - sino.original_min_hu;
+            spans[z] = (s <= 0.0f) ? 1.0f : s;
+
+            // Фильтрация синограммы через thread-local бэкенд
+            for (size_t a = 0; a < num_angles; ++a) {
+                std::fill(proj_padded.begin(), proj_padded.end(), 0.0f);
+                for (size_t i = 0; i < detector_bins; ++i) {
+                    size_t dst_idx = i + pad_before;
+                    if (dst_idx < projection_size_padded) {
+                        proj_padded[dst_idx] = sino.data[a][i];
+                    }
+                }
+
+                fft.forwardReal(proj_padded, spectrum);
+                for (size_t k = 0; k < spectrum_size; ++k) {
+                    spectrum[k] *= filter[k];
+                }
+                fft.inverseReal(spectrum, q);
+
+                float* dst_row = filtered_projs_all.rowPtr(a * depth + z);
+                for (size_t i = 0; i < square_bins; ++i) {
+                    dst_row[i] = q[i];
                 }
             }
-
-            FFT::forwardReal(proj_padded, spectrum);
-            for (size_t k = 0; k < spectrum_size; ++k) {
-                spectrum[k] *= filter[k];
-            }
-            FFT::inverseReal(spectrum, q);
-            
-            // Store in global buffer at index (a * depth + z)
-            float* dst_row = filtered_projs_all.rowPtr(a * depth + z);
-            for (size_t i = 0; i < square_bins; ++i) {
-                dst_row[i] = q[i];
-            }
         }
-    }
+    } // end parallel
 
     auto t_filter = std::chrono::steady_clock::now();
     m_lastSinogramTimeMs = std::chrono::duration<double, std::milli>(t_filter - t_start).count();

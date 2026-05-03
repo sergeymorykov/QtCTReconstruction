@@ -5,6 +5,19 @@
 
 namespace ct {
 
+// Ширина шага разворота по X в process_row совпадает с шириной SIMD-регистра:
+//   AVX-512: 16 float32 — один ZMM
+//   AVX2:     8 float32 — один YMM
+//   SSE/scalar: 4 float32 — один XMM
+// Компилятор разворачивает основной цикл по x в ровно одну SIMD-инструкцию.
+#if defined(__AVX512F__)
+    constexpr int BP_SIMD_WIDTH = 16;
+#elif defined(__AVX2__) || defined(__AVX__)
+    constexpr int BP_SIMD_WIDTH = 8;
+#else
+    constexpr int BP_SIMD_WIDTH = 4;
+#endif
+
 void OptimizedBackprojectionCPU::reconstruct(Volume& volume,
                                             const Buffer2D& projections,
                                             const std::vector<ProjectionMatrix>& matrices,
@@ -18,8 +31,31 @@ void OptimizedBackprojectionCPU::reconstruct(Volume& volume,
     const int nw = geom.nw;
     const int nh = geom.nh;
     const int total_projections = static_cast<int>(matrices.size());
+    const int nz_half = (nz + 1) / 2;  // перемещено выше для NUMA-инициализации
 
-    std::fill(volume.data.begin(), volume.data.end(), 0.0f);
+    // [P2] NUMA-aware first-touch: инициализируем буфер объёма нулями
+    // в том же распределении потоков, которое будет использоваться при backprojection.
+    // После std::vector::resize страницы «не тронуты»; первый запис-доступ
+    // маппирует страницу на NUMA-узел того потока, который его сделал.
+    // Если инициализировать через std::fill в главном потоке — все страницы
+    // окажутся на NUMA-узле 0, и остальные потоки будут читать через межузловую шину.
+    //
+    // Здесь мы явно параллельно заполняем нулями блоки, соответствующие
+    // half-z-слоям (schedule(dynamic) — как в основном цикле), чтобы
+    // маппинг страниц совпал с паттерном доступа при реконструкции.
+    {
+        const size_t vol_stride = static_cast<size_t>(nx) * ny;
+        float* raw = volume.data.data();
+        #pragma omp parallel for schedule(dynamic)
+        for (int z = 0; z < nz_half; ++z) {
+            const size_t z_pos     = static_cast<size_t>(z)           * vol_stride;
+            const size_t z_sym_pos = static_cast<size_t>(nz - 1 - z)  * vol_stride;
+            std::fill(raw + z_pos,     raw + z_pos     + vol_stride, 0.0f);
+            if (z != nz - 1 - z)
+                std::fill(raw + z_sym_pos, raw + z_sym_pos + vol_stride, 0.0f);
+        }
+    }
+
 
     struct ProjParams {
         float u_base_z0;
@@ -37,7 +73,6 @@ void OptimizedBackprojectionCPU::reconstruct(Volume& volume,
         all_params[p].v_base  = m[1][3];
     }
 
-    const int nz_half = (nz + 1) / 2;
     const float* projs_raw = projections.data.data();
     const size_t slice_size = static_cast<size_t>(nx) * ny;
 
@@ -86,21 +121,29 @@ void OptimizedBackprojectionCPU::reconstruct(Volume& volume,
             }
             if (x_start >= x_end) return;
 
+            // Основной цикл: BP_SIMD_WIDTH пикселей за итерацию.
+            // Компилятор авто-векторизует блок BP_SIMD_WIDTH = ширине регистра.
             int x = x_start;
-            for (; x <= x_end - 4; x += 4) {
-                const float u0f = static_cast<float>(x)   * du + u_base;
-                const float u1f = static_cast<float>(x+1) * du + u_base;
-                const float u2f = static_cast<float>(x+2) * du + u_base;
-                const float u3f = static_cast<float>(x+3) * du + u_base;
-                const int u0 = static_cast<int>(u0f); row[x]   += proj_row[u0] + (u0f - u0) * (proj_row[u0+1] - proj_row[u0]);
-                const int u1 = static_cast<int>(u1f); row[x+1] += proj_row[u1] + (u1f - u1) * (proj_row[u1+1] - proj_row[u1]);
-                const int u2 = static_cast<int>(u2f); row[x+2] += proj_row[u2] + (u2f - u2) * (proj_row[u2+1] - proj_row[u2]);
-                const int u3 = static_cast<int>(u3f); row[x+3] += proj_row[u3] + (u3f - u3) * (proj_row[u3+1] - proj_row[u3]);
+            for (; x <= x_end - BP_SIMD_WIDTH; x += BP_SIMD_WIDTH) {
+                // Развёртка вручную: BP_SIMD_WIDTH независимых acc за итерацию.
+                // Значения u0f..u(N-1)f вычисляются без зависимостей → SIMD.
+                #pragma omp simd
+                for (int d = 0; d < BP_SIMD_WIDTH; ++d) {
+                    const float uf = static_cast<float>(x + d) * du + u_base;
+                    const int   u0 = static_cast<int>(uf);
+                    row[x + d] += proj_row[u0] + (uf - static_cast<float>(u0))
+                                  * (proj_row[u0 + 1] - proj_row[u0]);
+                }
             }
-            for (; x < x_end; ++x) {
-                const float uf = static_cast<float>(x) * du + u_base;
+            // Хвостовой цикл: оставшиеся пиксели (< BP_SIMD_WIDTH)
+            // MSVC требует полной формы for (int ...) для #pragma omp simd
+            const int x_tail = x;
+            #pragma omp simd
+            for (int xt = x_tail; xt < x_end; ++xt) {
+                const float uf = static_cast<float>(xt) * du + u_base;
                 const int u0 = static_cast<int>(uf);
-                row[x] += proj_row[u0] + (uf - u0) * (proj_row[u0+1] - proj_row[u0]);
+                row[xt] += proj_row[u0] + (uf - static_cast<float>(u0))
+                          * (proj_row[u0 + 1] - proj_row[u0]);
             }
         };
 

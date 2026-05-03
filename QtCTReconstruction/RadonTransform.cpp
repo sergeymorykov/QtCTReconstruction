@@ -7,6 +7,20 @@
 
 namespace ct {
 
+// Размер батча углов выбирается под ширину SIMD-регистра целевой ISA:
+//   AVX-512: 16 float32 = один ZMM-регистр (512 бит)
+//   AVX2:     8 float32 = один YMM-регистр (256 бит)
+//   SSE/scalar: 4 float32 = один XMM-регистр (128 бит)
+// Совпадение batch и ширины регистра позволяет компилятору развернуть
+// внутренний цикл в одну SIMD-инструкцию без spill в стек.
+#if defined(__AVX512F__)
+    constexpr int ANGLE_BATCH = 16;
+#elif defined(__AVX2__) || defined(__AVX__)
+    constexpr int ANGLE_BATCH = 8;
+#else
+    constexpr int ANGLE_BATCH = 4;
+#endif
+
 Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, const size_t detector_bins, float min_hu, float max_hu, bool use_parallel) {
     Sinogram sino;
     if (slice.empty() || slice.width == 0 || slice.height == 0 || num_angles == 0 || detector_bins == 0) {
@@ -29,15 +43,16 @@ Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, co
     const int na = static_cast<int>(num_angles);
     const int db = static_cast<int>(detector_bins);
     
-    const int batch_size = 16;
     const int num_threads = use_parallel ? omp_get_max_threads() : 1;
 
+    // Стек-буферы для одного батча — размер определён constexpr ANGLE_BATCH
+    // (MSVC/GCC требуют константного размера VLA → используем ANGLE_BATCH)
     #pragma omp parallel for schedule(static) num_threads(num_threads) if(use_parallel)
-    for (int b_start = 0; b_start < na; b_start += batch_size) {
-        int b_count = std::min(batch_size, na - b_start);
+    for (int b_start = 0; b_start < na; b_start += ANGLE_BATCH) {
+        int b_count = std::min(ANGLE_BATCH, na - b_start);
         
-        float b_cos[16], b_sin[16], b_u_base[16];
-        float* b_rows[16];
+        float b_cos[ANGLE_BATCH], b_sin[ANGLE_BATCH], b_u_base[ANGLE_BATCH];
+        float* b_rows[ANGLE_BATCH];
         
         for (int b = 0; b < b_count; ++b) {
             float th = utils::degToRad(180.0f / static_cast<float>(na) * static_cast<float>(b_start + b));

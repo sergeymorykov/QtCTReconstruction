@@ -633,7 +633,15 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
-    backendImpl->reconstructVolume(volume, reconstructed_volume, params, nullptr);
+    try {
+        backendImpl->reconstructVolume(volume, reconstructed_volume, params, nullptr);
+    } catch (const std::exception& e) {
+        qDebug() << "[CT] EXCEPTION in reconstructVolume:" << e.what();
+        results.success = false;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        return results;
+    }
     cudaEventRecord(stop);
     
     cudaEventSynchronize(stop);
@@ -664,8 +672,8 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     #pragma omp parallel for reduction(+:global_mse, global_mae, cnt) reduction(max:max_abs, vmax) reduction(min:vmin)
     for (int z = 0; z < depth; ++z) {
         const size_t zi = static_cast<size_t>(z);
-        const ct::Slice& original = volume.getSlice(zi);
-        const ct::Slice& reconstruction = reconstructed_volume.getSlice(zi);
+        const ct::Slice original = volume.getSlice(zi);
+        const ct::Slice reconstruction = reconstructed_volume.getSlice(zi);
 
         for (size_t y = 0; y < original.height; ++y) {
             for (size_t x = 0; x < original.width; ++x) {
@@ -689,8 +697,8 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     #pragma omp parallel for
     for (int z = 0; z < depth; ++z) {
         const size_t zi = static_cast<size_t>(z);
-        const ct::Slice& original = volume.getSlice(zi);
-        const ct::Slice& reconstruction = reconstructed_volume.getSlice(zi);
+        const ct::Slice original = volume.getSlice(zi);
+        const ct::Slice reconstruction = reconstructed_volume.getSlice(zi);
         ct::Slice differences = ct::utils::subtract(reconstruction, original);
 
         if (results.sinogramImages && zi < results.sinogramImages->size()) {

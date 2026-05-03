@@ -29,10 +29,12 @@ public:
 
     PointCloud extractPointCloud(const Volume& vol, float threshold) override;
     double lastSinogramTimeMs() const override { return m_lastSinogramTimeMs; }
+    double lastReconstructionTimeMs() const override { return m_lastReconstructionTimeMs; }
 
 private:
     mutable std::recursive_mutex m_mutex;
     mutable double m_lastSinogramTimeMs = 0.0;
+    mutable double m_lastReconstructionTimeMs = 0.0;
 
     // Persistent GPU workspace (lazy-allocated, resized on demand)
     mutable float*        m_d_vol_in    = nullptr;  // input volume
@@ -45,6 +47,11 @@ private:
     mutable float*        m_d_sin       = nullptr;
     mutable float*        m_d_min_hu    = nullptr;  // per-slice [depth]
     mutable float*        m_d_span      = nullptr;  // per-slice [depth]
+    // Air-skipping boundary tables: u_min/u_max per (angle, z).
+    // Layout: row-major [angle * depth + z].
+    mutable int*          m_d_umin      = nullptr;
+    mutable int*          m_d_umax      = nullptr;
+    mutable size_t        m_boundCap    = 0;
 
     mutable size_t m_volCap      = 0;
     mutable size_t m_sinoCap     = 0;
@@ -60,7 +67,11 @@ private:
     mutable size_t      m_planBatch   = 0;
     mutable size_t      m_planPadded  = 0;
 
-    mutable std::vector<float> m_cachedAnglesDeg;
+    // Лёгкий кэш-сигнатура для ensureTrigTables (не храним полный вектор —
+    // его копирование в Debug-билде на больших объёмах вызывало access violation
+    // из-за фрагментации хипа).
+    mutable float m_cachedFirstAngle = 0.0f;
+    mutable float m_cachedLastAngle  = 0.0f;
 
     void ensureWorkspace(size_t w, size_t h, size_t d, size_t num_angles, size_t detector_bins) const;
     void ensureFilter(size_t padded_size, ReconstructionParams::FilterType type) const;
