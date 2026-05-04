@@ -260,18 +260,15 @@ void CUDABackend::releaseCache() const {
     if (m_d_sino)     { cudaFree(m_d_sino);      m_d_sino     = nullptr; }
     if (m_d_spectrum) { cudaFree(m_d_spectrum);  m_d_spectrum = nullptr; }
 
-    // [P1] Pinned host memory
+    // Pinned host memory
     if (m_h_slice_A) { cudaFreeHost(m_h_slice_A); m_h_slice_A = nullptr; }
-    if (m_h_slice_B) { cudaFreeHost(m_h_slice_B); m_h_slice_B = nullptr; }
     m_pinnedSliceCap = 0;
 
-    // [P1] CUDA streams & events
-    if (m_event_A)  { cudaEventDestroy(m_event_A);  m_event_A  = nullptr; }
-    if (m_event_B)  { cudaEventDestroy(m_event_B);  m_event_B  = nullptr; }
-    if (m_event_compute_A) { cudaEventDestroy(m_event_compute_A); m_event_compute_A = nullptr; }
-    if (m_event_compute_B) { cudaEventDestroy(m_event_compute_B); m_event_compute_B = nullptr; }
-    if (m_stream_A) { cudaStreamDestroy(m_stream_A); m_stream_A = nullptr; }
-    if (m_stream_B) { cudaStreamDestroy(m_stream_B); m_stream_B = nullptr; }
+    // Backprojection texture cache (пункт 3.1 из плана)
+    if (m_texObj)       { cudaDestroyTextureObject(m_texObj); m_texObj = 0; }
+    if (m_textureArray) { cudaFreeArray(m_textureArray); m_textureArray = nullptr; }
+    m_texArrayWidth = 0;
+    m_texArrayHeight = 0;
 
     if (m_planR2C) { cufftDestroy(m_planR2C); m_planR2C = 0; }
     if (m_planC2R) { cufftDestroy(m_planC2R); m_planC2R = 0; }
@@ -316,25 +313,46 @@ void CUDABackend::ensureWorkspace(size_t w, size_t h, size_t d, size_t num_angle
     }
 }
 
-// [P1] Pinned host buffers + CUDA streams/events
-void CUDABackend::ensurePinnedAndStreams(size_t slice_pixels) const {
-    // Streams & events: создаём один раз
-    if (!m_stream_A) CUDA_CHECK(cudaStreamCreate(&m_stream_A));
-    if (!m_stream_B) CUDA_CHECK(cudaStreamCreate(&m_stream_B));
-    if (!m_event_A)  CUDA_CHECK(cudaEventCreateWithFlags(&m_event_A, cudaEventDisableTiming));
-    if (!m_event_B)  CUDA_CHECK(cudaEventCreateWithFlags(&m_event_B, cudaEventDisableTiming));
-    if (!m_event_compute_A) CUDA_CHECK(cudaEventCreateWithFlags(&m_event_compute_A, cudaEventDisableTiming));
-    if (!m_event_compute_B) CUDA_CHECK(cudaEventCreateWithFlags(&m_event_compute_B, cudaEventDisableTiming));
+// Memory pool под backprojection texture: один cudaArray + один textureObject
+// переиспользуются между всеми вызовами reconstructSlice. На 256³ убирает
+// 256× cudaMallocArray/Free → экономия ~3-5 сек.
+void CUDABackend::ensureTextureCache(size_t num_angles, size_t square_bins) const {
+    if (m_textureArray && m_texObj &&
+        m_texArrayWidth == num_angles && m_texArrayHeight == square_bins) {
+        return;  // cache hit
+    }
 
-    // Pinned host buffers: пересоздаём только при увеличении размера среза
+    if (m_texObj)       { cudaDestroyTextureObject(m_texObj); m_texObj = 0; }
+    if (m_textureArray) { cudaFreeArray(m_textureArray); m_textureArray = nullptr; }
+
+    cudaChannelFormatDesc chDesc = cudaCreateChannelDesc<float>();
+    CUDA_CHECK(cudaMallocArray(&m_textureArray, &chDesc, num_angles, square_bins));
+
+    cudaResourceDesc resDesc = {};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = m_textureArray;
+
+    cudaTextureDesc texDesc = {};
+    texDesc.addressMode[0] = cudaAddressModeClamp;
+    texDesc.addressMode[1] = cudaAddressModeClamp;
+    texDesc.filterMode     = cudaFilterModePoint;  // точность float32 через ручной lerp
+    texDesc.readMode       = cudaReadModeElementType;
+    texDesc.normalizedCoords = 0;
+
+    CUDA_CHECK(cudaCreateTextureObject(&m_texObj, &resDesc, &texDesc, nullptr));
+
+    m_texArrayWidth  = num_angles;
+    m_texArrayHeight = square_bins;
+}
+
+// Pinned host buffer для быстрых H→D трансферов одного среза.
+void CUDABackend::ensurePinnedAndStreams(size_t slice_pixels) const {
     if (m_pinnedSliceCap < slice_pixels) {
         if (m_h_slice_A) cudaFreeHost(m_h_slice_A);
-        if (m_h_slice_B) cudaFreeHost(m_h_slice_B);
-        // cudaHostAllocPortable: доступен из любого CUDA-контекста
-        // cudaHostAllocWriteCombined: запись CPU без кэша → максимальная H→D пропускная способность
+        // cudaHostAllocPortable: доступен из любого CUDA-контекста.
+        // cudaHostAllocWriteCombined: запись CPU без кэша → максимальная H→D
+        // пропускная способность через PCIe (~12 ГБ/с против ~6 ГБ/с pageable).
         CUDA_CHECK(cudaHostAlloc(&m_h_slice_A, slice_pixels * sizeof(float),
-                                  cudaHostAllocPortable | cudaHostAllocWriteCombined));
-        CUDA_CHECK(cudaHostAlloc(&m_h_slice_B, slice_pixels * sizeof(float),
                                   cudaHostAllocPortable | cudaHostAllocWriteCombined));
         m_pinnedSliceCap = slice_pixels;
     }
@@ -535,24 +553,15 @@ Buffer2D CUDABackend::reconstructSlice(const Sinogram& sinogram, size_t output_s
         transposeScaleKernel<<<grd, blk>>>(d_sino_padded, d_filtered, (int)num_angles, (int)projection_size_padded, (int)square_bins, scale);
     }
 
-    // 5. Backprojection (результат в m_d_vol_out)
-    cudaChannelFormatDesc chDesc = cudaCreateChannelDesc<float>();
-    cudaArray_t cuArray;
-    CUDA_CHECK(cudaMallocArray(&cuArray, &chDesc, num_angles, square_bins));
-    CUDA_CHECK(cudaMemcpy2DToArray(cuArray, 0, 0, d_filtered, num_angles * sizeof(float), num_angles * sizeof(float), square_bins, cudaMemcpyDeviceToDevice));
-    
-    cudaResourceDesc resDesc = {};
-    resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = cuArray;
-    cudaTextureDesc texDesc = {};
-    texDesc.addressMode[0] = cudaAddressModeClamp;
-    texDesc.addressMode[1] = cudaAddressModeClamp;
-    texDesc.filterMode = cudaFilterModePoint; // Используем POINT и ручной lerp для точности float32
-    texDesc.readMode = cudaReadModeElementType;
-    texDesc.normalizedCoords = 0;
-
-    cudaTextureObject_t texObj = 0;
-    CUDA_CHECK(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL));
+    // 5. Backprojection (результат в m_d_vol_out).
+    // Memory pool: m_textureArray и m_texObj переиспользуются между вызовами,
+    // пересоздаются только при изменении размеров (см. ensureTextureCache).
+    ensureTextureCache(num_angles, square_bins);
+    CUDA_CHECK(cudaMemcpy2DToArray(
+        m_textureArray, 0, 0,
+        d_filtered, num_angles * sizeof(float),
+        num_angles * sizeof(float), square_bins,
+        cudaMemcpyDeviceToDevice));
 
     float* d_recon = m_d_vol_out;
     {
@@ -560,8 +569,8 @@ Buffer2D CUDABackend::reconstructSlice(const Sinogram& sinogram, size_t output_s
         dim3 bp_grid((output_size + bp_block.x - 1) / bp_block.x, (output_size + bp_block.y - 1) / bp_block.y);
 
         backprojectionTextureKernel<<<bp_grid, bp_block>>>(
-            texObj, d_recon, 
-            (int)output_size, (int)num_angles, (int)square_bins, 
+            m_texObj, d_recon,
+            (int)output_size, (int)num_angles, (int)square_bins,
             (float)(output_size - 1) * 0.5f, (float)(square_bins - 1) * 0.5f
         );
     }
@@ -575,9 +584,6 @@ Buffer2D CUDABackend::reconstructSlice(const Sinogram& sinogram, size_t output_s
 
     recon.assign(output_size, output_size, 0.0f);
     CUDA_CHECK(cudaMemcpy(recon.data.data(), d_recon, output_size * output_size * sizeof(float), cudaMemcpyDeviceToHost));
-
-    CUDA_CHECK(cudaDestroyTextureObject(texObj));
-    CUDA_CHECK(cudaFreeArray(cuArray));
 
     return recon;
 }
@@ -646,6 +652,16 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
     // ----------------------------------------------------------------
     float* pinned_buf = m_h_slice_A;  // одного буфера достаточно
 
+    // Local Sinogram buffer, поднятый из loop'а (пункт 3.2 — упрощённая версия).
+    // Раньше каждая итерация делала Sinogram s; s.data.assign(...) →
+    // ~360 КБ heap-аллокация × depth раз. Теперь — один раз перед loop'ом.
+    // Persistent member избегаем: vector::operator= на персистентном векторе
+    // ранее давал heap corruption под фрагментацией Debug-кучи.
+    Sinogram s;
+    s.data.assign(width, params.num_angles, 0.0f);
+    s.angles_deg = angles;
+    s.detector_spacing_mm = 1.0f;
+
     auto t_vol_start = std::chrono::high_resolution_clock::now();
 
     for (size_t z = 0; z < depth; ++z) {
@@ -682,15 +698,12 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
             (int)params.num_angles, (int)width,
             cx, cy, det_center, 0);
 
-        // 5. Sino D→H для передачи в reconstructSlice (которая ожидает Sinogram)
+        // 5. Sino D→H в local буфер (выделен один раз перед loop'ом)
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        Sinogram s;
-        s.data.assign(width, params.num_angles, 0.0f);
         CUDA_CHECK(cudaMemcpy(s.data.data.data(), m_d_sino,
                                params.num_angles * width * sizeof(float),
                                cudaMemcpyDeviceToHost));
-        s.angles_deg      = angles;
         s.original_min_hu = slice_min[z];
         s.original_max_hu = slice_max[z];
 
