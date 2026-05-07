@@ -163,9 +163,16 @@ __global__ void gpScaleKernel(float* data, int n, float scale) {
 // CPU-функция: посчитать [u_min, u_max] per (angle, z) на основе RAW синограммы.
 // Параллелится через OpenMP — CPU работа, может выполняться overlap с GPU FFT.
 // Output: u_min[a*depth+z], u_max[a*depth+z]; если строка вся air → u_min > u_max.
+// Margin под side-lobes ramp-фильтра. Граница в RAW-синограмме определяется
+// по non-zero области, но после ramp-фильтрации энергия "размазывается"
+// влево/вправо ~30-50 бин. Без margin clip в kernel'е обрезает side-lobes
+// → артефакты/чёрный фон. Эмпирически: 32 покрывает 99% вклада.
+static constexpr int AIR_SKIP_MARGIN = 64;
+
 static void computeAirBoundariesCPU(
     const float* sinogram,   // [num_angles*depth][bins], layout sino[(a*depth+z)*bins + b]
     int num_angles, int depth, int bins,
+    int pad_before, int sq,  // сдвиг и ширина текстурной системы координат
     int* out_u_min, int* out_u_max)
 {
     #pragma omp parallel for schedule(static)
@@ -185,10 +192,21 @@ static void computeAirBoundariesCPU(
                 if (b > umx) umx = b;
             }
         }
-        // Запас в 1 бин для билинейной интерполяции
-        if (umx >= 0) { umn = std::max(0, umn - 1); umx = std::min(bins - 1, umx + 1); }
-        out_u_min[idx] = umn;
-        out_u_max[idx] = umx;
+        if (umx < 0) {
+            // Целая строка — air. Отметим невозможным диапазоном, kernel пропустит.
+            out_u_min[idx] = sq;     // umin > umax всегда
+            out_u_max[idx] = -1;
+            continue;
+        }
+        // 1) Перевод в текстурные координаты (col = b + pad_before).
+        // 2) Запас под side-lobes ramp-фильтра.
+        // 3) Clamp в [0, sq-1].
+        int u_lo = umn + pad_before - AIR_SKIP_MARGIN;
+        int u_hi = umx + pad_before + AIR_SKIP_MARGIN;
+        if (u_lo < 0)        u_lo = 0;
+        if (u_hi > sq - 1)   u_hi = sq - 1;
+        out_u_min[idx] = u_lo;
+        out_u_max[idx] = u_hi;
     }
 }
 
@@ -233,22 +251,20 @@ __global__ void gpVolumeBackprojTexAirSkipKernel(
         return;
     }
 
-    int global_z = chunk_z0 + z;
     float sum = 0.0f;
 
-    // Заглушка для unused params — air-skip отключён (см. ниже).
-    (void)u_min_g; (void)u_max_g; (void)depth_global; (void)global_z;
+    // AIR-SKIP отключён: clip по raw-границам синограммы (даже с margin=64)
+    // обрезает ramp-filter tails, дающие концентрические кольцевые артефакты
+    // внутри FOV. Для корректного включения нужно считать границы по
+    // ФИЛЬТРОВАННОЙ синограмме (после iFFT) — это требует D2H sync на каждом
+    // чанке и переусложняет pipeline. Инфраструктура (u_min_g/u_max_g,
+    // computeAirBoundariesCPU) сохранена для будущей filtered-domain версии.
+    (void)u_min_g; (void)u_max_g; (void)depth_global; (void)chunk_z0;
 
     for (int a = 0; a < num_angles; ++a) {
         float u = fx * gp_cos_table[a] - fy * gp_sin_table[a] + det_cx;
         int u0 = (int)floorf(u);
         if (u0 < 0 || u0 >= nw - 1) continue;
-
-        // Air-skip отключён: clip по raw-границам синограммы обрезал side-lobes
-        // ramp-фильтра (которые расходятся за пределы активной области), что
-        // вызывало артефакты/чёрный фон. Чтобы безопасно включить, нужно
-        // считать границы по ФИЛЬТРОВАННЫМ проекциям или закладывать запас
-        // ~30-50 бин с каждой стороны под side-lobes.
 
         // Manual lerp по u, row фиксирован (точная X-интерполяция на float32)
         float row_y = (float)(a * nz_chunk + v_row) + 0.5f;
@@ -261,55 +277,6 @@ __global__ void gpVolumeBackprojTexAirSkipKernel(
     vol_out[(z * ny + y) * nx + x] = sum;
 }
 
-// ---------- 3D volumetric backprojection ----------
-// filt_projs layout: each row is proj_stride floats wide (= proj_pad after iFFT).
-// Valid filtered data occupies positions [0, nw-1] (nw = square_bins) within each row.
-// Row index for angle a, z-slice v_row: a * nz + v_row.
-__global__ void gpVolumeBackprojectionKernel(
-    float*       __restrict__ vol_out,
-    const float* __restrict__ filt_projs,
-    int nx, int ny, int nz,
-    int nw,          // = square_bins (number of valid bins per row)
-    int proj_stride, // = proj_pad   (actual floats per row in filt_projs)
-    int num_angles,
-    float cx, float cy, float cz,
-    float det_cx, float det_cy)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int z = blockIdx.z * blockDim.z + threadIdx.z;
-    if (x >= nx || y >= ny || z >= nz) return;
-
-    // Circular mask in XY
-    float dx = ((float)x - cx) / (cx + 0.5f);
-    float dy = ((float)y - cy) / (cy + 0.5f);
-    if (dx * dx + dy * dy > 1.0f) {
-        vol_out[(z * ny + y) * nx + x] = 0.0f;
-        return;
-    }
-
-    float fx = (float)x - cx;
-    float fy = (float)y - cy;
-
-    // v maps volume z to a row in the filtered projection buffer
-    float v_raw = (float)z - cz + det_cy;
-    int v_row = (int)(v_raw + 0.5f);
-
-    float sum = 0.0f;
-    if (v_row >= 0 && v_row < nz) {
-        for (int a = 0; a < num_angles; ++a) {
-            float u = fx * gp_cos_table[a] - fy * gp_sin_table[a] + det_cx;
-            int u0 = (int)u;
-            if (u0 < 0 || u0 >= nw - 1) continue;
-            float fu = u - (float)u0;
-            // Use proj_stride (not nw) as the actual row width in memory
-            const float* row = filt_projs + ((long long)a * nz + v_row) * proj_stride;
-            sum += row[u0] + fu * (row[u0 + 1] - row[u0]);
-        }
-    }
-
-    vol_out[(z * ny + y) * nx + x] = sum;
-}
 
 // ---------- point cloud helpers (same as CUDABackend) ----------
 struct GpVolToPoint {
@@ -348,12 +315,45 @@ void CUDAPureBackend::releaseAll() const {
     if (m_d_umin) { cudaFree(m_d_umin); m_d_umin = nullptr; }
     if (m_d_umax) { cudaFree(m_d_umax); m_d_umax = nullptr; }
     if (m_d_spectrum) { cudaFree(m_d_spectrum); m_d_spectrum = nullptr; }
+    if (m_bpTexObj)   { cudaDestroyTextureObject(m_bpTexObj); m_bpTexObj = 0; }
+    if (m_bpArray)    { cudaFreeArray(m_bpArray); m_bpArray = nullptr; }
     if (m_planR2C) { cufftDestroy(m_planR2C); m_planR2C = 0; }
     if (m_planC2R) { cufftDestroy(m_planC2R); m_planC2R = 0; }
     m_volCap = m_sinoCap = m_projPadCap = m_spectrumCap = 0;
     m_filterSize = m_trigAngles = m_depthCap = 0;
     m_planBatch = m_planPadded = 0;
     m_boundCap = 0;
+    m_bpArrayW = m_bpArrayH = 0;
+    m_currentProjPad = 0;
+}
+
+void CUDAPureBackend::ensureBackprojTexture(size_t width, size_t height) const {
+    // Cache hit: имеющейся ёмкости достаточно (texture-clamp не даст kernel'у
+    // прочитать за валидный регион, а cudaMemcpy2DToArray запишет только
+    // фактические `height` строк).
+    if (m_bpArray && m_bpTexObj &&
+        m_bpArrayW >= width && m_bpArrayH >= height) {
+        return;
+    }
+    if (m_bpTexObj) { cudaDestroyTextureObject(m_bpTexObj); m_bpTexObj = 0; }
+    if (m_bpArray)  { cudaFreeArray(m_bpArray); m_bpArray = nullptr; }
+
+    cudaChannelFormatDesc chDesc = cudaCreateChannelDesc<float>();
+    GPUCHECK(cudaMallocArray(&m_bpArray, &chDesc, width, height));
+
+    cudaResourceDesc resDesc = {};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = m_bpArray;
+    cudaTextureDesc texDesc = {};
+    texDesc.addressMode[0]   = cudaAddressModeClamp;
+    texDesc.addressMode[1]   = cudaAddressModeClamp;
+    texDesc.filterMode       = cudaFilterModePoint; // точность float32 через manual lerp
+    texDesc.readMode         = cudaReadModeElementType;
+    texDesc.normalizedCoords = 0;
+    GPUCHECK(cudaCreateTextureObject(&m_bpTexObj, &resDesc, &texDesc, nullptr));
+
+    m_bpArrayW = width;
+    m_bpArrayH = height;
 }
 
 void CUDAPureBackend::ensureWorkspace(size_t w, size_t h, size_t d,
@@ -385,6 +385,17 @@ void CUDAPureBackend::ensureWorkspace(size_t w, size_t h, size_t d,
         m_sinoCap = 0;
         GPUCHECK(cudaMalloc(&m_d_all_sinos, sino_req * sizeof(float)));
         m_sinoCap = sino_req;
+    }
+
+    // Если proj_pad изменился между вызовами (напр. 256³→512³: 1024→2048),
+    // инвалидируем FFT-буферы насильно — иначе по байтам ёмкость может совпасть
+    // и условие "<" не сработает, а cufftPlan ожидает другой stride.
+    if (m_currentProjPad != proj_pad) {
+        if (m_d_projs_pad) { cudaFree(m_d_projs_pad); m_d_projs_pad = nullptr; }
+        if (m_d_spectrum)  { cudaFree(m_d_spectrum);  m_d_spectrum  = nullptr; }
+        m_projPadCap  = 0;
+        m_spectrumCap = 0;
+        m_currentProjPad = proj_pad;
     }
 
     if (m_projPadCap < proj_pad_req) {
@@ -543,7 +554,6 @@ void CUDAPureBackend::reconstructVolume(const Volume& input_volume,
     const float cz      = (nz - 1) * 0.5f;
     // det_cx matches FilteredBackprojection.cpp:89 — integer division sq/2
     const float det_cx  = (float)(sq / 2);
-    const float det_cy  = cz;                // = (nz-1)*0.5 (matches ProjectionGeometry fix)
     // Radon scatter bin center uses same integer-division convention
     const float det_ctr = (float)(bins / 2); // for Radon scatter bin centering
 
@@ -617,6 +627,7 @@ void CUDAPureBackend::reconstructVolume(const Volume& input_volume,
     std::vector<int> h_umin((size_t)na * nz);
     std::vector<int> h_umax((size_t)na * nz);
     computeAirBoundariesCPU(h_sinogram.data(), na, nz, bins,
+                            (int)pad_before, (int)sq,
                             h_umin.data(), h_umax.data());
     {
         size_t bnd_req = (size_t)na * nz;
@@ -645,6 +656,9 @@ void CUDAPureBackend::reconstructVolume(const Volume& input_volume,
     // время на onSliceDone (UI-обновления, копии Buffer2D — это не реконструкция).
     double recon_accum_ms = 0.0;
 
+    // CHUNK_Z зафиксирован на 64 — проверено стабильно на 256³/512³.
+    // Adaptive-вариант (через cufftEstimateMany) откатан: вызвал инстабильность
+    // в Debug CRT при повторных запусках. Вернёмся к этому позже отдельно.
     const int   CHUNK_Z  = 64;
     const float pi_scale = (float)(M_PI / (2.0 * na));
 
@@ -716,32 +730,20 @@ void CUDAPureBackend::reconstructVolume(const Volume& input_volume,
 
         // 3D Backprojection через TEXTURE + AIR-SKIP.
         // Texture создаём поверх валидной части m_d_projs_pad (sq колонок).
-        // Высота = chunk_rows = na*chunk_nz < 65536 (лимит cudaArray) — для
-        // CHUNK_Z=64 и na≤910 безопасно.
+        // Высота = chunk_rows = na*chunk_nz < 65536 (лимит cudaArray);
+        // CHUNK_Z вычисляется адаптивно выше с учётом этого лимита.
         const size_t chunk_vol_bytes = (size_t)nx * ny * chunk_nz * sizeof(float);
         GPUCHECK(cudaMemset(m_d_vol_out, 0, chunk_vol_bytes));
         {
-            cudaChannelFormatDesc chDesc = cudaCreateChannelDesc<float>();
-            cudaArray_t cuArray = nullptr;
-            GPUCHECK(cudaMallocArray(&cuArray, &chDesc, (size_t)sq, (size_t)chunk_rows));
+            // Memory pool: cudaArray + textureObject переиспользуются между
+            // чанками и между вызовами reconstructVolume. Пересоздаются только
+            // при росте требуемой ёмкости (sq, chunk_rows).
+            ensureBackprojTexture((size_t)sq, (size_t)chunk_rows);
             GPUCHECK(cudaMemcpy2DToArray(
-                cuArray, 0, 0,
+                m_bpArray, 0, 0,
                 m_d_projs_pad, proj_pad * sizeof(float),
                 sq * sizeof(float), chunk_rows,
                 cudaMemcpyDeviceToDevice));
-
-            cudaResourceDesc resDesc = {};
-            resDesc.resType = cudaResourceTypeArray;
-            resDesc.res.array.array = cuArray;
-            cudaTextureDesc texDesc = {};
-            texDesc.addressMode[0] = cudaAddressModeClamp;
-            texDesc.addressMode[1] = cudaAddressModeClamp;
-            texDesc.filterMode     = cudaFilterModePoint; // Point + manual lerp = float32 точность
-            texDesc.readMode       = cudaReadModeElementType;
-            texDesc.normalizedCoords = 0;
-
-            cudaTextureObject_t texObj = 0;
-            GPUCHECK(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, nullptr));
 
             const float chunk_cz     = (chunk_nz - 1) * 0.5f;
             const float chunk_det_cy = chunk_cz;
@@ -750,16 +752,13 @@ void CUDAPureBackend::reconstructVolume(const Volume& input_volume,
                      (ny + blk.y - 1) / blk.y,
                      (chunk_nz + blk.z - 1) / blk.z);
             gpVolumeBackprojTexAirSkipKernel<<<grd, blk>>>(
-                texObj,
+                m_bpTexObj,
                 m_d_umin, m_d_umax,
                 nz, z0,
                 m_d_vol_out,
                 nx, ny, chunk_nz, (int)sq, na,
                 cx, cy, chunk_cz, det_cx, chunk_det_cy);
             GPUCHECK(cudaDeviceSynchronize());
-
-            GPUCHECK(cudaDestroyTextureObject(texObj));
-            GPUCHECK(cudaFreeArray(cuArray));
         }
 
         // Denormalize

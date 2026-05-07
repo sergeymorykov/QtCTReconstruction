@@ -53,6 +53,16 @@ private:
     mutable int*          m_d_umax      = nullptr;
     mutable size_t        m_boundCap    = 0;
 
+    // Backprojection texture cache (memory pool).
+    // Раньше каждый чанк делал cudaMallocArray + cudaCreateTextureObject +
+    // cudaDestroyTextureObject + cudaFreeArray. С adaptive CHUNK_Z это всё ещё
+    // 1-N раз за реконструкцию + повторно между вызовами reconstructVolume.
+    // Кэш переиспользует массив/объект пока ёмкости (W,H) достаточно.
+    mutable cudaArray_t         m_bpArray   = nullptr;
+    mutable cudaTextureObject_t m_bpTexObj  = 0;
+    mutable size_t              m_bpArrayW  = 0; // ёмкость по ширине  (sq)
+    mutable size_t              m_bpArrayH  = 0; // ёмкость по высоте (chunk_rows)
+
     mutable size_t m_volCap      = 0;
     mutable size_t m_sinoCap     = 0;
     mutable size_t m_projPadCap  = 0;
@@ -67,6 +77,12 @@ private:
     mutable size_t      m_planBatch   = 0;
     mutable size_t      m_planPadded  = 0;
 
+    // Last-seen proj_pad для FFT-буферов. Если меняется (например, переход
+    // 256³→512³ — proj_pad 1024→2048) — буферы инвалидируются, даже если по
+    // байтам ёмкости совпадают. Иначе stride/layout под cufftPlan не совпадёт
+    // с физическим буфером — потенциально heap corruption на host-стороне.
+    mutable size_t m_currentProjPad = 0;
+
     // Лёгкий кэш-сигнатура для ensureTrigTables (не храним полный вектор —
     // его копирование в Debug-билде на больших объёмах вызывало access violation
     // из-за фрагментации хипа).
@@ -77,6 +93,7 @@ private:
     void ensureFilter(size_t padded_size, ReconstructionParams::FilterType type) const;
     void ensurePlans(size_t batch, size_t padded_size) const;
     void ensureTrigTables(const std::vector<float>& angles_deg) const;
+    void ensureBackprojTexture(size_t width, size_t height) const;
     void releaseAll() const;
 };
 

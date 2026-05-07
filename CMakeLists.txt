@@ -184,6 +184,53 @@ if(MSVC)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler /Zc:preprocessor")
 endif()
 
+# ============================================================
+# CUDA optimisation flags (5.1)
+# ------------------------------------------------------------
+# Release / RelWithDebInfo:
+#   -O3                       — макс. оптимизация PTX
+#   --use_fast_math           — sincos→__sincosf, fdiv→__fdividef, FTZ denormals
+#                               (для Radon/backproj точность float32 достаточна;
+#                                ramp-filter и lerp не страдают)
+#   -lineinfo                 — source-маркировка для Nsight Compute / nvprof
+#                               (НЕ отключает оптимизации, безопасно в Release)
+#   --ptxas-options=-v        — печать регистров/spills в build log
+#   -Xcompiler /O2 (MSVC)     — host-сторону NVCC тоже оптимизировать
+#
+# Debug:
+#   По умолчанию NVCC ставит -G -g → kernel'ы в 5-15× медленнее.
+#   Опция CT_CUDA_FAST_DEBUG=ON убирает -G (host-debug сохраняется), полезна
+#   для бенчмаркинга в IDE без переключения конфигурации.
+# ============================================================
+option(CT_CUDA_FAST_DEBUG
+       "Strip -G from Debug CUDA flags (kernels run at full speed; host -g kept)"
+       OFF)
+
+set(_ct_cuda_release_flags
+    -O3
+    --use_fast_math
+    -lineinfo
+    --ptxas-options=-v
+)
+if(MSVC)
+    list(APPEND _ct_cuda_release_flags -Xcompiler=/O2)
+endif()
+
+target_compile_options(${PROJECT_NAME} PRIVATE
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:${_ct_cuda_release_flags}>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:${_ct_cuda_release_flags}>
+)
+
+if(CT_CUDA_FAST_DEBUG)
+    # NVCC ставит -G -g для Debug по дефолту через CMAKE_CUDA_FLAGS_DEBUG.
+    # Перезаписываем: только -g (host debug info), без device-debug → kernels
+    # компилируются с оптимизацией.
+    set(CMAKE_CUDA_FLAGS_DEBUG "-g" CACHE STRING "" FORCE)
+    message(STATUS "[CT] CUDA Debug: FAST mode (no -G, kernels optimised)")
+else()
+    message(STATUS "[CT] CUDA Debug: standard mode (-G -g, kernels NON-optimised)")
+endif()
+
 if(WIN32)
     find_program(WINDEPLOYQT windeployqt 
         HINTS "${Qt6Core_DIR}/../../../bin" 
