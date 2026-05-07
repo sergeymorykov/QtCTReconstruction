@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -258,11 +259,31 @@ void CUDABackend::releaseCache() const {
     if (m_d_vol_in)   { cudaFree(m_d_vol_in);   m_d_vol_in   = nullptr; }
     if (m_d_vol_out)  { cudaFree(m_d_vol_out);  m_d_vol_out  = nullptr; }
     if (m_d_sino)     { cudaFree(m_d_sino);      m_d_sino     = nullptr; }
+    if (m_d_filt)     { cudaFree(m_d_filt);      m_d_filt     = nullptr; }
     if (m_d_spectrum) { cudaFree(m_d_spectrum);  m_d_spectrum = nullptr; }
 
-    // Pinned host memory
+    // Pinned host memory (оба слота ping-pong)
     if (m_h_slice_A) { cudaFreeHost(m_h_slice_A); m_h_slice_A = nullptr; }
+    if (m_h_slice_B) { cudaFreeHost(m_h_slice_B); m_h_slice_B = nullptr; }
     m_pinnedSliceCap = 0;
+
+    // Ping-pong device буфер + streams + events (§6.2)
+    if (m_d_vol_in_alt) { cudaFree(m_d_vol_in_alt); m_d_vol_in_alt = nullptr; }
+    m_altSliceCap = 0;
+
+    if (m_pingpongInited) {
+        cudaStreamDestroy(m_stream_copy);
+        cudaStreamDestroy(m_stream_compute);
+        for (int i = 0; i < 2; ++i) {
+            cudaEventDestroy(m_event_h2d_done[i]);
+            cudaEventDestroy(m_event_compute_done[i]);
+            m_event_h2d_done[i] = nullptr;
+            m_event_compute_done[i] = nullptr;
+        }
+        m_stream_copy = nullptr;
+        m_stream_compute = nullptr;
+        m_pingpongInited = false;
+    }
 
     // Backprojection texture cache (пункт 3.1 из плана)
     if (m_texObj)       { cudaDestroyTextureObject(m_texObj); m_texObj = 0; }
@@ -278,6 +299,7 @@ void CUDABackend::releaseCache() const {
     m_trigAngles = 0;
     m_volSize = 0;
     m_sinoSize = 0;
+    m_filtSize = 0;
     m_spectrumSize = 0;
 }
 
@@ -294,6 +316,10 @@ void CUDABackend::ensureWorkspace(size_t w, size_t h, size_t d, size_t num_angle
     size_t padded_sino_req = num_angles * projection_size_padded;
     if (vol_req < padded_sino_req) vol_req = padded_sino_req;
 
+    // m_d_filt — транспонированная фильтрованная синограмма для backproj-текстуры.
+    // Раньше переиспользовался m_d_vol_in (см. CUDABackend.h), теперь отдельный.
+    size_t filt_req = square_bins * num_angles;
+
     if (m_volSize < vol_req) {
         if (m_d_vol_in)  cudaFree(m_d_vol_in);
         if (m_d_vol_out) cudaFree(m_d_vol_out);
@@ -305,6 +331,11 @@ void CUDABackend::ensureWorkspace(size_t w, size_t h, size_t d, size_t num_angle
         if (m_d_sino) cudaFree(m_d_sino);
         CUDA_CHECK(cudaMalloc(&m_d_sino, sino_req * sizeof(float)));
         m_sinoSize = sino_req;
+    }
+    if (m_filtSize < filt_req) {
+        if (m_d_filt) cudaFree(m_d_filt);
+        CUDA_CHECK(cudaMalloc(&m_d_filt, filt_req * sizeof(float)));
+        m_filtSize = filt_req;
     }
     if (m_spectrumSize < spec_req) {
         if (m_d_spectrum) cudaFree(m_d_spectrum);
@@ -345,16 +376,44 @@ void CUDABackend::ensureTextureCache(size_t num_angles, size_t square_bins) cons
     m_texArrayHeight = square_bins;
 }
 
-// Pinned host buffer для быстрых H→D трансферов одного среза.
+// Pinned host buffers (×2) + второй device-буфер + 2 stream + 4 event.
+// Всё нужно для ping-pong-pipeline в reconstructVolume (§6.2).
+//
+// cudaHostAllocPortable: доступен из любого CUDA-контекста.
+// cudaHostAllocWriteCombined: запись CPU без кэша → максимальная H→D
+// пропускная способность через PCIe (~12 ГБ/с против ~6 ГБ/с pageable).
+// Читать из такой памяти CPU нельзя (медленно) — мы только пишем.
 void CUDABackend::ensurePinnedAndStreams(size_t slice_pixels) const {
     if (m_pinnedSliceCap < slice_pixels) {
         if (m_h_slice_A) cudaFreeHost(m_h_slice_A);
-        // cudaHostAllocPortable: доступен из любого CUDA-контекста.
-        // cudaHostAllocWriteCombined: запись CPU без кэша → максимальная H→D
-        // пропускная способность через PCIe (~12 ГБ/с против ~6 ГБ/с pageable).
+        if (m_h_slice_B) cudaFreeHost(m_h_slice_B);
         CUDA_CHECK(cudaHostAlloc(&m_h_slice_A, slice_pixels * sizeof(float),
                                   cudaHostAllocPortable | cudaHostAllocWriteCombined));
+        CUDA_CHECK(cudaHostAlloc(&m_h_slice_B, slice_pixels * sizeof(float),
+                                  cudaHostAllocPortable | cudaHostAllocWriteCombined));
         m_pinnedSliceCap = slice_pixels;
+    }
+
+    // Второй device-буфер среза (m_d_vol_in — первый). Размер чисто под
+    // slice_pixels, в отличие от m_d_vol_in (который раздут до vol_req
+    // в ensureWorkspace).
+    if (m_altSliceCap < slice_pixels) {
+        if (m_d_vol_in_alt) cudaFree(m_d_vol_in_alt);
+        CUDA_CHECK(cudaMalloc(&m_d_vol_in_alt, slice_pixels * sizeof(float)));
+        m_altSliceCap = slice_pixels;
+    }
+
+    // Streams + events создаются один раз и переиспользуются.
+    if (!m_pingpongInited) {
+        CUDA_CHECK(cudaStreamCreate(&m_stream_copy));
+        CUDA_CHECK(cudaStreamCreate(&m_stream_compute));
+        for (int i = 0; i < 2; ++i) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&m_event_h2d_done[i],
+                                                 cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&m_event_compute_done[i],
+                                                 cudaEventDisableTiming));
+        }
+        m_pingpongInited = true;
     }
 }
 
@@ -544,8 +603,9 @@ Buffer2D CUDABackend::reconstructSlice(const Sinogram& sinogram, size_t output_s
 
     cufftExecC2R(m_planC2R, m_d_spectrum, (cufftReal*)d_sino_padded);
 
-    // 4. Transpose and scale (результат в m_d_vol_in)
-    float* d_filtered = m_d_vol_in; 
+    // 4. Transpose and scale (результат в m_d_filt — отдельный буфер, не пересекается
+    //    с m_d_vol_in, в который reconstructVolume пишет следующий срез ping-pong'ом).
+    float* d_filtered = m_d_filt;
     {
         float scale = 1.0f / (float)projection_size_padded;
         dim3 blk(32, 32);
@@ -621,85 +681,110 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
     std::vector<float> slice_max(depth, 0.0f);
 
     // ----------------------------------------------------------------
-    // [P1] Двойная буферизация (ping-pong):
-    //   stream_copy  → копирует slice[z] H→D через pinned-буфер
-    //   stream_compute → нормализует + проецирует + реконструирует slice[z-1]
+    // §6.2: Ping-pong pipeline. Два слота:
+    //   slot 0 = (m_h_slice_A, m_d_vol_in)
+    //   slot 1 = (m_h_slice_B, m_d_vol_in_alt)
     //
-    // Схема:
-    //   Итерация z:
-    //     1. memcpy(pinned_cur, host_data[z], async)  — stream_copy
-    //     2. record(event_copy) на stream_copy
-    //     3. stream_compute ждёт event_copy (wait)
-    //     4. cudaMemcpyAsync(d_vol_in, pinned_cur, async) — stream_compute
-    //     5. ядра normalize + scatter + reconstruct — stream_compute
-    //     6. cudaMemcpyAsync(host_out[z-1], d_recon, async) — stream_compute
+    // Параллелизм:
+    //   m_stream_compute: ждёт event_h2d_done[i] → normalize+radon[z]
+    //                     (читает d_slice[i], пишет m_d_sino) → record event_compute_done[i]
+    //   m_stream_copy:    ждёт event_compute_done[j] (j = (z+1)%2) → H2D[z+1]
+    //                     (пишет d_slice[j]) → record event_h2d_done[j]
+    //   main thread:      cpu_pack(z+1) — OpenMP min/max+memcpy в pinned[j].
+    //                     Запускается между issue(compute[z]) и sync(compute[z]),
+    //                     поэтому ~1.5 мс CPU-работы прячется за ~5-10 мс GPU.
     //
-    // Для четных z используем буфер A, нечётных — B (ping-pong).
+    // §6.1 уже обеспечил отсутствие race на m_d_vol_in (filtered scratch
+    // переехал в m_d_filt), поэтому ping-pong безопасен.
+    // §6.3: cpu_pack делает min/max в одном OpenMP-проходе (без thrust).
     // ----------------------------------------------------------------
+    float* d_slice[2] = { m_d_vol_in,  m_d_vol_in_alt };
+    float* h_slice[2] = { m_h_slice_A, m_h_slice_B    };
 
-    // ----------------------------------------------------------------
-    // Линейный per-slice pipeline (ping-pong удалён).
-    //
-    // Причина: reconstructSlice внутри использует m_d_vol_in как буфер для
-    // транспонированной фильтрованной синограммы (transposeScaleKernel пишет
-    // туда → cudaMemcpy2DToArray читает оттуда). Это конфликтовало с попыткой
-    // stream_copy параллельно записывать туда же следующий срез — race с
-    // непредсказуемым исходом (либо garbage в thrust, либо off-by-one).
-    //
-    // Pinned-память сохранена — даёт ~2x пропускной способности H→D
-    // относительно pageable. Per-slice H2D ≈ 0.3 мс на 256² @ PCIe 3.0 x16,
-    // в общем времени реконструкции <1%, поэтому потеря overlap минимальна.
-    // ----------------------------------------------------------------
-    float* pinned_buf = m_h_slice_A;  // одного буфера достаточно
+    auto cpu_pack = [&](size_t z, int slot) {
+        const float* src = input_volume.data.data() + z * slice_pixels;
+        float vmin =  std::numeric_limits<float>::infinity();
+        float vmax = -std::numeric_limits<float>::infinity();
+        const long long N = (long long)slice_pixels;
+        #pragma omp parallel for reduction(min:vmin) reduction(max:vmax) schedule(static)
+        for (long long i = 0; i < N; ++i) {
+            float v = src[i];
+            h_slice[slot][i] = v;          // pinned WC: only write
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+        slice_min[z] = vmin;
+        slice_max[z] = vmax;
+    };
 
-    // Local Sinogram buffer, поднятый из loop'а (пункт 3.2 — упрощённая версия).
-    // Раньше каждая итерация делала Sinogram s; s.data.assign(...) →
-    // ~360 КБ heap-аллокация × depth раз. Теперь — один раз перед loop'ом.
-    // Persistent member избегаем: vector::operator= на персистентном векторе
-    // ранее давал heap corruption под фрагментацией Debug-кучи.
+    // Local Sinogram buffer, выделенный один раз (см. §3.2).
     Sinogram s;
     s.data.assign(width, params.num_angles, 0.0f);
     s.angles_deg = angles;
     s.detector_spacing_mm = 1.0f;
 
+    const float cx = (float)(width  - 1) * 0.5f;
+    const float cy = (float)(height - 1) * 0.5f;
+    const float det_center = (float)((int)width / 2);
+
     auto t_vol_start = std::chrono::high_resolution_clock::now();
 
+    // Initial prefetch slice 0 → slot 0. Никаких wait не нужно, это первый H2D.
+    cpu_pack(0, 0);
+    CUDA_CHECK(cudaMemcpyAsync(d_slice[0], h_slice[0], slice_bytes,
+                                cudaMemcpyHostToDevice, m_stream_copy));
+    cudaEventRecord(m_event_h2d_done[0], m_stream_copy);
+
     for (size_t z = 0; z < depth; ++z) {
-        // 1. CPU memcpy в pinned host buffer (для max H→D пропускной способности)
-        const float* src = input_volume.data.data() + z * slice_pixels;
-        std::memcpy(pinned_buf, src, slice_bytes);
+        const int slot = (int)(z % 2);
 
-        // 2. Sync H→D в m_d_vol_in
-        CUDA_CHECK(cudaMemcpy(m_d_vol_in, pinned_buf, slice_bytes, cudaMemcpyHostToDevice));
+        // 1. Issue compute[z] на m_stream_compute. Ждёт пока H2D[z] (slot)
+        //    закончится. Возвращается мгновенно, GPU работает в фоне.
+        cudaStreamWaitEvent(m_stream_compute, m_event_h2d_done[slot], 0);
 
-        // 3. min/max → нормализация
-        thrust::device_ptr<float> dp(m_d_vol_in);
-        float vmin = *thrust::min_element(dp, dp + slice_pixels);
-        float vmax = *thrust::max_element(dp, dp + slice_pixels);
-        slice_min[z] = vmin;
-        slice_max[z] = vmax;
-
+        float vmin = slice_min[z];
+        float vmax = slice_max[z];
         float span = vmax - vmin;
         if (span < 1e-6f) span = 1.0f;
         const int grid_norm = (int)((slice_pixels + 255) / 256);
-        normalizeGPUKernel<<<grid_norm, 256>>>(
-            m_d_vol_in, (int)slice_pixels, vmin, 1.0f / span);
-
-        // 4. Forward Radon (gather, no atomic)
-        const float cx = (float)(width  - 1) * 0.5f;
-        const float cy = (float)(height - 1) * 0.5f;
-        const float det_center = (float)((int)width / 2);
+        normalizeGPUKernel<<<grid_norm, 256, 0, m_stream_compute>>>(
+            d_slice[slot], (int)slice_pixels, vmin, 1.0f / span);
 
         dim3 blk(16, 16);
         dim3 grd(((int)width + 15) / 16, ((int)params.num_angles + 15) / 16);
-        radonForwardGatherKernel<<<grd, blk>>>(
-            m_d_vol_in, m_d_sino,
+        radonForwardGatherKernel<<<grd, blk, 0, m_stream_compute>>>(
+            d_slice[slot], m_d_sino,
             (int)width, (int)height,
             (int)params.num_angles, (int)width,
             cx, cy, det_center, 0);
 
-        // 5. Sino D→H в local буфер (выделен один раз перед loop'ом)
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // Сигнал: slot можно перезаписать (compute больше его не читает).
+        cudaEventRecord(m_event_compute_done[slot], m_stream_compute);
+
+        // 2. Параллельно с compute[z]: prefetch slice z+1 в другой slot.
+        //    cpu_pack — ~1.5 мс CPU-работы на main thread, прячется за GPU.
+        //    cudaMemcpyAsync — ~0.5 мс H2D на m_stream_copy, прячется за GPU.
+        if (z + 1 < depth) {
+            const int slot_next = (int)((z + 1) % 2);
+
+            // Не запускать H2D в slot_next пока его прежний compute не закончил
+            // его читать. На z=0 event_compute_done[1] ещё не record'ался —
+            // CUDA трактует такой wait как мгновенно удовлетворённый.
+            cudaStreamWaitEvent(m_stream_copy, m_event_compute_done[slot_next], 0);
+
+            cpu_pack(z + 1, slot_next);
+
+            CUDA_CHECK(cudaMemcpyAsync(d_slice[slot_next], h_slice[slot_next],
+                                        slice_bytes, cudaMemcpyHostToDevice,
+                                        m_stream_copy));
+            cudaEventRecord(m_event_h2d_done[slot_next], m_stream_copy);
+        }
+
+        // 3. Дождаться compute[z], скачать синограмму, FBP.
+        //    reconstructSlice работает на default stream — он автоматически
+        //    синхронизируется с обоими explicit-stream'ами (legacy default
+        //    stream blocks all).
+        CUDA_CHECK(cudaStreamSynchronize(m_stream_compute));
 
         CUDA_CHECK(cudaMemcpy(s.data.data.data(), m_d_sino,
                                params.num_angles * width * sizeof(float),
@@ -707,13 +792,16 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
         s.original_min_hu = slice_min[z];
         s.original_max_hu = slice_max[z];
 
-        // 6. FBP (reconstructSlice — переиспользует m_d_vol_in/m_d_vol_out)
         Buffer2D recon = reconstructSlice(s, (int)width, params);
         out_reconstruction.setSlice(z, recon);
 
         if (onSliceDone) onSliceDone((int)z, recon);
     }
 
+    // Финальный sync — m_stream_copy мог иметь висящий H2D, но в нашем
+    // алгоритме prefetch выдаётся только при z+1 < depth, поэтому после
+    // последней итерации stream_copy уже idle. Вызов оставлен для
+    // совместимости (cudaDeviceSynchronize забирает все streams).
     CUDA_CHECK(cudaDeviceSynchronize());
 
     auto t_vol_end = std::chrono::high_resolution_clock::now();
