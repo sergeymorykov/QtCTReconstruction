@@ -152,11 +152,15 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 # === FIX FOR MSVC: LLVM OpenMP + C++ Exception Semantics ===
+# OpenMP also enabled for CUDA host code so #pragma omp works inside .cu files.
+# CUDABackend uses OpenMP in reconstructVolume for CPU-side min/max + slice pack
+# (см. план оптимизаций §6.3 — гибрид CPU+GPU).
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>
         $<$<COMPILE_LANGUAGE:CXX>:/openmp:experimental>
         $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/openmp:llvm>
     )
 endif()
 

@@ -34,17 +34,41 @@ private:
     mutable double m_lastSinogramTimeMs = 0.0;
 
     // ---- Device workspace ----
+    // m_d_vol_in:  входной срез (computeSinogram, reconstructVolume)
+    // m_d_vol_out: padded sinogram (FFT/filter), затем recon output (FBP)
+    // m_d_filt:    транспонированная фильтрованная синограмма (square_bins × num_angles).
+    //              Раньше переиспользовался m_d_vol_in, но это создавало shared-buffer
+    //              race с входным срезом — мешало ping-pong streams (план §6.1).
     mutable float* m_d_vol_in  = nullptr;
     mutable float* m_d_vol_out = nullptr;
     mutable float* m_d_sino    = nullptr;
+    mutable float* m_d_filt    = nullptr;
     mutable size_t m_volSize   = 0;
     mutable size_t m_sinoSize  = 0;
+    mutable size_t m_filtSize  = 0;
 
     // ---- Pinned host memory ----
     // cudaHostAllocPortable | cudaHostAllocWriteCombined: пропускная способность H→D
     // ~12 ГБ/с на PCIe 3.0 x16 против ~6 ГБ/с pageable memory.
-    mutable float*  m_h_slice_A = nullptr;   // pinned host буфер для H→D одного среза
-    mutable size_t  m_pinnedSliceCap = 0;    // размер (пикселей)
+    // Два буфера для ping-pong (§6.2): пока GPU обрабатывает slice[z] из A,
+    // CPU+H2D готовят slice[z+1] в B (и наоборот).
+    mutable float*  m_h_slice_A = nullptr;   // pinned host буфер для H→D, slot 0
+    mutable float*  m_h_slice_B = nullptr;   // pinned host буфер для H→D, slot 1
+    mutable size_t  m_pinnedSliceCap = 0;    // размер каждого буфера (пикселей)
+
+    // ---- Ping-pong device slice + streams + events (план §6.2) ----
+    // m_d_vol_in выступает первым device-буфером среза, m_d_vol_in_alt — вторым.
+    // m_stream_copy несёт H2D[z+1] параллельно с normalize+forward Radon[z]
+    // на m_stream_compute. Pipeline:
+    //   stream_compute: wait(h2d[i]) → normalize → radon → record(compute[i])
+    //   stream_copy:    wait(compute[i_next]) → H2D → record(h2d[i_next])
+    mutable float*       m_d_vol_in_alt           = nullptr;
+    mutable size_t       m_altSliceCap            = 0;
+    mutable cudaStream_t m_stream_copy            = nullptr;
+    mutable cudaStream_t m_stream_compute         = nullptr;
+    mutable cudaEvent_t  m_event_h2d_done[2]      = { nullptr, nullptr };  // [i] = H2D в slot i завершено
+    mutable cudaEvent_t  m_event_compute_done[2]  = { nullptr, nullptr };  // [i] = compute, читавший slot i, завершён
+    mutable bool         m_pingpongInited         = false;
 
     // ---- Filter cache ----
     mutable float*  m_d_filter      = nullptr;
