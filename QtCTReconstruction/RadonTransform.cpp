@@ -1,6 +1,7 @@
 #include "RadonTransform.h"
 
 #include "Utils.h"
+#include "AlignedBuf.h"
 
 #include <cmath>
 #include <omp.h>
@@ -50,10 +51,14 @@ Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, co
     #pragma omp parallel for schedule(static) num_threads(num_threads) if(use_parallel)
     for (int b_start = 0; b_start < na; b_start += ANGLE_BATCH) {
         int b_count = std::min(ANGLE_BATCH, na - b_start);
-        
-        float b_cos[ANGLE_BATCH], b_sin[ANGLE_BATCH], b_u_base[ANGLE_BATCH];
+
+        // 64-байт выровненные стек-буферы: попадают целиком в одну cache line
+        // на AVX2/AVX-512 → SIMD-загрузки без штрафа за unaligned access.
+        alignas(64) float b_cos[ANGLE_BATCH];
+        alignas(64) float b_sin[ANGLE_BATCH];
+        alignas(64) float b_u_base[ANGLE_BATCH];
         float* b_rows[ANGLE_BATCH];
-        
+
         for (int b = 0; b < b_count; ++b) {
             float th = utils::degToRad(180.0f / static_cast<float>(na) * static_cast<float>(b_start + b));
             b_cos[b] = std::cos(th);
@@ -64,13 +69,13 @@ Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, co
 
         for (size_t y = 0; y < h; ++y) {
             const float yy = static_cast<float>(y);
-            const float* slice_ptr = &slice.data[y * w];
+            const float* CT_RESTRICT slice_ptr = &slice.data[y * w];
 
-            float b_u_y[16];
+            alignas(64) float b_u_y[16];
             for (int b = 0; b < b_count; ++b) {
                 b_u_y[b] = -yy * b_sin[b] + b_u_base[b];
             }
-            
+
             for (size_t x = 0; x < w; ++x) {
                 const float v_raw = slice_ptr[x];
                 if (v_raw == 0.0f) continue;
@@ -81,11 +86,12 @@ Sinogram RadonTransform::forward(const Slice& slice, const size_t num_angles, co
                 for (int b = 0; b < b_count; ++b) {
                     const float u = xx * b_cos[b] + b_u_y[b];
                     const int i0 = static_cast<int>(u);
-                    
+
                     if (i0 >= 0 && i0 < db - 1) {
                         const float frac = u - static_cast<float>(i0);
-                        b_rows[b][i0] += v * (1.0f - frac);
-                        b_rows[b][i0 + 1] += v * frac;
+                        float* CT_RESTRICT row = b_rows[b];
+                        row[i0]     += v * (1.0f - frac);
+                        row[i0 + 1] += v * frac;
                     } else if (i0 == db - 1) {
                         b_rows[b][i0] += v;
                     }

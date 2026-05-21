@@ -24,14 +24,16 @@ public:
                            std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) override;
 
     PointCloud extractPointCloud(const Volume& vol, float threshold) override;
-    double lastSinogramTimeMs() const override { return m_lastSinogramTimeMs; }
-    
+    double lastSinogramTimeMs()       const override { return m_lastSinogramTimeMs; }
+    double lastReconstructionTimeMs() const override { return m_lastReconstructionTimeMs; }
+
     // Пакетная очистка кэша
     void clearWorkspace() const;
 
 private:
     mutable std::recursive_mutex m_mutex;
-    mutable double m_lastSinogramTimeMs = 0.0;
+    mutable double m_lastSinogramTimeMs       = 0.0;
+    mutable double m_lastReconstructionTimeMs = 0.0;
 
     // ---- Device workspace ----
     // m_d_vol_in:  входной срез (computeSinogram, reconstructVolume)
@@ -69,6 +71,13 @@ private:
     mutable cudaEvent_t  m_event_h2d_done[2]      = { nullptr, nullptr };  // [i] = H2D в slot i завершено
     mutable cudaEvent_t  m_event_compute_done[2]  = { nullptr, nullptr };  // [i] = compute, читавший slot i, завершён
     mutable bool         m_pingpongInited         = false;
+
+    // ---- Pure-GPU min/max workspace (per slot) ----
+    // Pure GPU реализация: thrust::minmax_element на m_stream_compute.
+    // d_vminmax[slot] хранит { vmin, vmax } для slot, h_vminmax[slot] — pinned
+    // copy для host'а (нужна перед reconstructSlice для denormalize).
+    mutable float* m_d_vminmax[2] = { nullptr, nullptr };  // 2 floats per slot, device
+    mutable float* m_h_vminmax[2] = { nullptr, nullptr };  // 2 floats per slot, pinned host
 
     // ---- Filter cache ----
     mutable float*  m_d_filter      = nullptr;

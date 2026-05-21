@@ -649,9 +649,19 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     cudaEventElapsedTime(&gpu_compute_ms, start, stop);
 
     const auto t_recon_done = std::chrono::steady_clock::now();
-    results.sinogramTimeSec = backendImpl->lastSinogramTimeMs() / 1000.0; 
-    results.reconTimeSec = std::chrono::duration<double>(t_recon_done - t_total_start).count() - results.sinogramTimeSec;
-    
+    results.sinogramTimeSec = backendImpl->lastSinogramTimeMs() / 1000.0;
+
+    // Используем backend-репортируемое время реконструкции, если оно есть
+    // (HybridBackend измеряет ЭТАП II отдельно). Иначе fallback на wall-clock
+    // (CUDABackend и др. не разделяют фазы, для них lastReconstructionTimeMs()=0).
+    const double backend_recon_ms = backendImpl->lastReconstructionTimeMs();
+    if (backend_recon_ms > 0.0) {
+        results.reconTimeSec = backend_recon_ms / 1000.0;
+    } else {
+        results.reconTimeSec = std::chrono::duration<double>(t_recon_done - t_total_start).count()
+                              - results.sinogramTimeSec;
+    }
+
     qDebug() << "[CT] computeAll: batch recon done.";
     qDebug() << "[BENCH] GPU Compute Only:" << gpu_compute_ms << "ms";
     qDebug() << "[BENCH] Total (with CPU logic):" << (results.reconTimeSec * 1000.0) << "ms";
@@ -723,7 +733,10 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
 
     const auto t_total_end = std::chrono::steady_clock::now();
     const double totalSec = std::chrono::duration<double>(t_total_end - t_total_start).count();
-    results.reconTimeSec = totalSec - results.sinogramTimeSec;
+    // НЕ переписываем results.reconTimeSec: оно уже зафиксировано выше, ДО UI-loop'а.
+    // Постобработка (повторный computeSinogram для UI, генерация QImage) НЕ должна
+    // засчитываться как «время реконструкции» — иначе backend несправедливо обвиняется.
+    (void)totalSec;
 
     global_mse = (cnt > 0) ? (global_mse / static_cast<double>(cnt)) : 0.0;
     global_mae = (cnt > 0) ? (global_mae / static_cast<double>(cnt)) : 0.0;

@@ -44,7 +44,7 @@ public:
 // Простая фабрика для получения бэкендов
 class BackendFactory {
 public:
-    enum class BackendType { Serial, OpenMP, CUDA, CUDAPure };
+    enum class BackendType { Serial, OpenMP, CUDA, Hybrid };
 
     static std::shared_ptr<IReconstructionBackend> create(BackendType type);
     static std::shared_ptr<IReconstructionBackend> createBestAvailable();

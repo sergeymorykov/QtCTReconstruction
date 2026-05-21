@@ -38,7 +38,7 @@ set(SOURCES
     QtCTReconstruction/BackendFactory.cpp
     QtCTReconstruction/OpenMPBackend.cpp
     QtCTReconstruction/CUDABackend.cu
-    QtCTReconstruction/CUDAPureBackend.cu
+    QtCTReconstruction/HybridBackend.cu
     QtCTReconstruction/PointCloudGeometry.cpp
     QtCTReconstruction/OptimizedBackprojectionCPU.cpp
     QtCTReconstruction/ProjectionGeometry.cpp
@@ -153,8 +153,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 # === FIX FOR MSVC: LLVM OpenMP + C++ Exception Semantics ===
 # OpenMP also enabled for CUDA host code so #pragma omp works inside .cu files.
-# CUDABackend uses OpenMP in reconstructVolume for CPU-side min/max + slice pack
-# (см. план оптимизаций §6.3 — гибрид CPU+GPU).
+# HybridBackend.cu использует OpenMP для CPU-стадии (computeAirBoundariesFilteredCPU);
+# CUDABackend сам по себе pure-GPU, но компиляция CUDA-host-кода под /openmp:llvm
+# нужна для совместимости (исключения, runtime).
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>

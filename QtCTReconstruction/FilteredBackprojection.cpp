@@ -3,6 +3,7 @@
 #include "IFFTBackend.h"       // thread-local FFT-бэкенд (Builtin или FFTW3)
 #include "FilterDesign.h"
 #include "Utils.h"
+#include "AlignedBuf.h"
 
 #include <cmath>
 #include <omp.h>
@@ -61,6 +62,9 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
         IFFTBackend& fft = IFFTBackend::threadLocal();
         fft.prepare(projection_size_padded); // no-op если размер не изменился
 
+        // IFFTBackend требует std::vector<float> (default allocator) в сигнатуре;
+        // поэтому используем дефолтный аллокатор. CT_RESTRICT-указатели в hot-loop'ах
+        // ниже дают компилятору гарантию неперекрытия, что включает SIMD-векторизацию.
         std::vector<float>   proj_padded(projection_size_padded, 0.0f);
         std::vector<Complex> spectrum(spectrum_size);
         std::vector<float>   q(projection_size_padded);
@@ -68,9 +72,10 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
         #pragma omp for schedule(dynamic)
         for (int a = 0; a < na; ++a) {
             std::fill(proj_padded.begin(), proj_padded.end(), 0.0f);
-            const float* src_row = sino_square[static_cast<size_t>(a)];
+            const float* CT_RESTRICT src_row = sino_square[static_cast<size_t>(a)];
+            float* CT_RESTRICT pp = proj_padded.data();
             for (size_t i = 0; i < square_bins; ++i) {
-                proj_padded[i] = src_row[i];
+                pp[i] = src_row[i];
             }
 
             fft.forwardReal(proj_padded, spectrum);
@@ -79,9 +84,10 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
             }
             fft.inverseReal(spectrum, q);
 
-            float* dst_row = filtered[static_cast<size_t>(a)];
+            float* CT_RESTRICT dst_row = filtered[static_cast<size_t>(a)];
+            const float* CT_RESTRICT qp = q.data();
             for (size_t i = 0; i < square_bins; ++i) {
-                dst_row[i] = q[i];
+                dst_row[i] = qp[i];
             }
         }
     } // end parallel
@@ -99,31 +105,34 @@ Slice FilteredBackprojection::reconstruct(const Sinogram& sinogram, size_t outpu
     }
 
     const int ny = static_cast<int>(output_size);
+    const float* CT_RESTRICT cos_ptr = cos_table.data();
+    const float* CT_RESTRICT sin_ptr = sin_table.data();
     #pragma omp parallel for schedule(dynamic)
     for (int y = 0; y < ny; ++y) {
         const float yy = static_cast<float>(y) - radius;
+        float* CT_RESTRICT recon_row = recon[static_cast<size_t>(y)];
         for (size_t x = 0; x < output_size; ++x) {
             const float xx = static_cast<float>(x) - radius;
             float sum = 0.0f;
 
             if (xx * xx + yy * yy > radius * radius) {
-                recon[static_cast<size_t>(y)][x] = 0.0f;
+                recon_row[x] = 0.0f;
                 continue;
             }
 
             for (size_t a = 0; a < num_angles; ++a) {
-                const float t = xx * cos_table[a] - yy * sin_table[a];
+                const float t = xx * cos_ptr[a] - yy * sin_ptr[a];
                 const float u = t + detector_center;
-                
+
                 const int i0 = static_cast<int>(std::floor(u));
                 const int i1 = i0 + 1;
                 const float frac = u - static_cast<float>(i0);
                 if (i0 >= 0 && i1 < static_cast<int>(square_bins)) {
-                    const float* f_row = filtered[a];
+                    const float* CT_RESTRICT f_row = filtered[a];
                     sum += utils::lerp(f_row[i0], f_row[i1], frac);
                 }
             }
-            recon[static_cast<size_t>(y)][x] = sum;
+            recon_row[x] = sum;
         }
     }
 

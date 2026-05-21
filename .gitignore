@@ -361,7 +361,8 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
-
+_diary_work/
+.claude/
 # Source
 book/
 example/

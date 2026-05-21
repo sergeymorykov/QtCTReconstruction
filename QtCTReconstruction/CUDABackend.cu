@@ -4,6 +4,7 @@
 #include "Utils.h"
 
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <vector>
@@ -19,6 +20,7 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/extrema.h>
 #include <thrust/device_ptr.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -40,14 +42,27 @@ namespace {
         } \
     } while(0)
 
-// Нормализация in-place на GPU
-__global__ void normalizeGPUKernel(float* data, int n, float vmin, float inv_span) {
+// Нормализация in-place на GPU (host-side vmin/inv_span — для single-slice path)
+__global__ void normalizeGPUKernel(float* __restrict__ data, int n, float vmin, float inv_span) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) data[i] = (data[i] - vmin) * inv_span;
 }
 
+// Pure-GPU нормализация: vmin/vmax берутся из device-памяти (результат thrust на потоке).
+// Это позволяет всему пайплайну (minmax → normalize → radon) быть полностью async.
+__global__ void normalizeFromDevicePairKernel(float* __restrict__ data, int n,
+                                              const float* __restrict__ d_vminmax) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float vmin = d_vminmax[0];
+    float vmax = d_vminmax[1];
+    float span = vmax - vmin;
+    if (span < 1e-6f) span = 1.0f;
+    data[i] = (data[i] - vmin) / span;
+}
+
 // Денормализация in-place на GPU
-__global__ void denormalizeGPUKernel(float* data, int n, float vmin, float span) {
+__global__ void denormalizeGPUKernel(float* __restrict__ data, int n, float vmin, float span) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) data[i] = data[i] * span + vmin;
 }
@@ -120,6 +135,7 @@ __global__ void radonForwardGatherKernel(
 
     float sum = 0.0f;
     float t = -half;
+    #pragma unroll 4
     for (int i = 0; i < n_samples; ++i, t += 1.0f) {
         float x = bx + t * dx;
         float y = by + t * dy;
@@ -188,6 +204,7 @@ __global__ void backprojectionTextureKernel(
     }
 
     float sum = 0.0f;
+    #pragma unroll 4
     for (int a = 0; a < num_angles; ++a) {
         // Чтение из Constant Memory
         float t = xx * c_cos_table[a] - yy * c_sin_table[a];
@@ -270,6 +287,12 @@ void CUDABackend::releaseCache() const {
     // Ping-pong device буфер + streams + events (§6.2)
     if (m_d_vol_in_alt) { cudaFree(m_d_vol_in_alt); m_d_vol_in_alt = nullptr; }
     m_altSliceCap = 0;
+
+    // Pure-GPU min/max workspace
+    for (int s = 0; s < 2; ++s) {
+        if (m_d_vminmax[s]) { cudaFree(m_d_vminmax[s]);     m_d_vminmax[s] = nullptr; }
+        if (m_h_vminmax[s]) { cudaFreeHost(m_h_vminmax[s]); m_h_vminmax[s] = nullptr; }
+    }
 
     if (m_pingpongInited) {
         cudaStreamDestroy(m_stream_copy);
@@ -414,6 +437,17 @@ void CUDABackend::ensurePinnedAndStreams(size_t slice_pixels) const {
                                                  cudaEventDisableTiming));
         }
         m_pingpongInited = true;
+    }
+
+    // Pure-GPU min/max: 2 floats per slot на device + pinned host для D2H.
+    for (int s = 0; s < 2; ++s) {
+        if (!m_d_vminmax[s]) {
+            CUDA_CHECK(cudaMalloc(&m_d_vminmax[s], 2 * sizeof(float)));
+        }
+        if (!m_h_vminmax[s]) {
+            CUDA_CHECK(cudaHostAlloc(&m_h_vminmax[s], 2 * sizeof(float),
+                                     cudaHostAllocPortable));
+        }
     }
 }
 
@@ -701,20 +735,13 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
     float* d_slice[2] = { m_d_vol_in,  m_d_vol_in_alt };
     float* h_slice[2] = { m_h_slice_A, m_h_slice_B    };
 
+    // Pure GPU: cpu_pack теперь только memcpy → pinned (никакой OpenMP-редукции
+    // и анализа значений). Все вычисления — на GPU. WC-pinned память пишется
+    // линейно одним потоком — main thread не блокируется, бенефит overlap'a
+    // обеспечивается H2D через m_stream_copy.
     auto cpu_pack = [&](size_t z, int slot) {
         const float* src = input_volume.data.data() + z * slice_pixels;
-        float vmin =  std::numeric_limits<float>::infinity();
-        float vmax = -std::numeric_limits<float>::infinity();
-        const long long N = (long long)slice_pixels;
-        #pragma omp parallel for reduction(min:vmin) reduction(max:vmax) schedule(static)
-        for (long long i = 0; i < N; ++i) {
-            float v = src[i];
-            h_slice[slot][i] = v;          // pinned WC: only write
-            if (v < vmin) vmin = v;
-            if (v > vmax) vmax = v;
-        }
-        slice_min[z] = vmin;
-        slice_max[z] = vmax;
+        std::memcpy(h_slice[slot], src, slice_pixels * sizeof(float));
     };
 
     // Local Sinogram buffer, выделенный один раз (см. §3.2).
@@ -729,6 +756,11 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
 
     auto t_vol_start = std::chrono::high_resolution_clock::now();
 
+    // Раздельное накопление времён, чтобы корректно заполнить
+    // lastSinogramTimeMs (radon-этап) и lastReconstructionTimeMs (FBP-этап).
+    double sino_accum_ms  = 0.0;
+    double recon_accum_ms = 0.0;
+
     // Initial prefetch slice 0 → slot 0. Никаких wait не нужно, это первый H2D.
     cpu_pack(0, 0);
     CUDA_CHECK(cudaMemcpyAsync(d_slice[0], h_slice[0], slice_bytes,
@@ -742,13 +774,29 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
         //    закончится. Возвращается мгновенно, GPU работает в фоне.
         cudaStreamWaitEvent(m_stream_compute, m_event_h2d_done[slot], 0);
 
-        float vmin = slice_min[z];
-        float vmax = slice_max[z];
-        float span = vmax - vmin;
-        if (span < 1e-6f) span = 1.0f;
+        // 1a. Pure-GPU min/max через thrust на m_stream_compute (полностью async).
+        //     Возвращает device iterators — копируем значения в m_d_vminmax[slot].
+        thrust::device_ptr<float> dp(d_slice[slot]);
+        auto mm = thrust::minmax_element(
+            thrust::cuda::par.on(m_stream_compute),
+            dp, dp + slice_pixels);
+        CUDA_CHECK(cudaMemcpyAsync(m_d_vminmax[slot],
+                                    thrust::raw_pointer_cast(mm.first),
+                                    sizeof(float),
+                                    cudaMemcpyDeviceToDevice, m_stream_compute));
+        CUDA_CHECK(cudaMemcpyAsync(m_d_vminmax[slot] + 1,
+                                    thrust::raw_pointer_cast(mm.second),
+                                    sizeof(float),
+                                    cudaMemcpyDeviceToDevice, m_stream_compute));
+        // 1b. Параллельный async D2H пары для host'а (нужна позже в reconstructSlice).
+        CUDA_CHECK(cudaMemcpyAsync(m_h_vminmax[slot], m_d_vminmax[slot],
+                                    2 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, m_stream_compute));
+
+        // 1c. Normalize с device-side vmin/span.
         const int grid_norm = (int)((slice_pixels + 255) / 256);
-        normalizeGPUKernel<<<grid_norm, 256, 0, m_stream_compute>>>(
-            d_slice[slot], (int)slice_pixels, vmin, 1.0f / span);
+        normalizeFromDevicePairKernel<<<grid_norm, 256, 0, m_stream_compute>>>(
+            d_slice[slot], (int)slice_pixels, m_d_vminmax[slot]);
 
         dim3 blk(16, 16);
         dim3 grd(((int)width + 15) / 16, ((int)params.num_angles + 15) / 16);
@@ -762,7 +810,7 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
         cudaEventRecord(m_event_compute_done[slot], m_stream_compute);
 
         // 2. Параллельно с compute[z]: prefetch slice z+1 в другой slot.
-        //    cpu_pack — ~1.5 мс CPU-работы на main thread, прячется за GPU.
+        //    cpu_pack теперь только memcpy → pinned, ~0.5-1мс,
         //    cudaMemcpyAsync — ~0.5 мс H2D на m_stream_copy, прячется за GPU.
         if (z + 1 < depth) {
             const int slot_next = (int)((z + 1) % 2);
@@ -780,19 +828,31 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
             cudaEventRecord(m_event_h2d_done[slot_next], m_stream_copy);
         }
 
-        // 3. Дождаться compute[z], скачать синограмму, FBP.
-        //    reconstructSlice работает на default stream — он автоматически
-        //    синхронизируется с обоими explicit-stream'ами (legacy default
-        //    stream blocks all).
+        // 3. Дождаться compute[z] (включая D2H vminmax), скачать синограмму, FBP.
+        auto t_sino_a = std::chrono::high_resolution_clock::now();
         CUDA_CHECK(cudaStreamSynchronize(m_stream_compute));
+
+        // Теперь m_h_vminmax[slot] валиден: [0] = vmin, [1] = vmax
+        const float vmin = m_h_vminmax[slot][0];
+        const float vmax = m_h_vminmax[slot][1];
+        slice_min[z] = vmin;
+        slice_max[z] = vmax;
 
         CUDA_CHECK(cudaMemcpy(s.data.data.data(), m_d_sino,
                                params.num_angles * width * sizeof(float),
                                cudaMemcpyDeviceToHost));
-        s.original_min_hu = slice_min[z];
-        s.original_max_hu = slice_max[z];
+        s.original_min_hu = vmin;
+        s.original_max_hu = vmax;
+        auto t_sino_b = std::chrono::high_resolution_clock::now();
+        sino_accum_ms += std::chrono::duration<double, std::milli>(t_sino_b - t_sino_a).count();
 
+        // reconstructSlice = полный FBP-путь (pack + FFT + filter + iFFT + transpose
+        // + backproj + denorm + D2H recon). Это и есть «реконструкция» в смысле UI.
+        auto t_recon_a = std::chrono::high_resolution_clock::now();
         Buffer2D recon = reconstructSlice(s, (int)width, params);
+        auto t_recon_b = std::chrono::high_resolution_clock::now();
+        recon_accum_ms += std::chrono::duration<double, std::milli>(t_recon_b - t_recon_a).count();
+
         out_reconstruction.setSlice(z, recon);
 
         if (onSliceDone) onSliceDone((int)z, recon);
@@ -805,8 +865,16 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
     CUDA_CHECK(cudaDeviceSynchronize());
 
     auto t_vol_end = std::chrono::high_resolution_clock::now();
-    m_lastSinogramTimeMs = std::chrono::duration<double, std::milli>(
+    const double total_ms = std::chrono::duration<double, std::milli>(
         t_vol_end - t_vol_start).count();
+
+    // Раздельная отчётность фаз:
+    //   sino  = sum(sync stream_compute + D2H sinogram)  ~ ping-pong Radon + PCIe
+    //   recon = sum(reconstructSlice)                    ~ pack+FFT+filter+iFFT+backproj+denorm+D2H
+    // Сумма sino+recon обычно < total_ms из-за overlap'a H2D и compute через ping-pong.
+    m_lastSinogramTimeMs       = sino_accum_ms;
+    m_lastReconstructionTimeMs = recon_accum_ms;
+    (void)total_ms;
 }
 
 

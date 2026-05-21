@@ -86,10 +86,10 @@ Window {
                 // Serial (index 0) — однопоточный эталон для регрессионных тестов,
                 // доступен только в Debug-сборке (как кнопка "3D Cloud Viewer").
                 // Значения model[] соответствуют BackendType enum:
-                //   Serial=0, OpenMP=1, CUDA=2, CUDAPure=3
+                //   Serial=0, OpenMP=1, CUDA=2, Hybrid=3
                 model: controller.isDebugBuild
-                    ? ["Serial (1-thread)", "OpenMP (CPU)", "CUDA (GPU+CPU)", "CUDA Pure (Full-GPU)"]
-                    : ["OpenMP (CPU)", "CUDA (GPU+CPU)", "CUDA Pure (Full-GPU)"]
+                    ? ["Serial (1-thread)", "OpenMP (CPU)", "CUDA (Pure GPU)", "Hybrid (CUDA + OpenMP)"]
+                    : ["OpenMP (CPU)", "CUDA (Pure GPU)", "Hybrid (CUDA + OpenMP)"]
 
                 // При использовании debug-списка индекс UI == значение enum.
                 // В release-списке Serial нет, поэтому офсет = 1 (Serial пропускаем).

@@ -1,4 +1,5 @@
 #include "OptimizedBackprojectionCPU.h"
+#include "AlignedBuf.h"
 #include <cmath>
 #include <algorithm>
 #include <omp.h>
@@ -109,7 +110,9 @@ void OptimizedBackprojectionCPU::reconstruct(Volume& volume,
             bd[p].u_base_z_n = fz_sym * bp.du_dz + bp.u_base_z0;
         }
 
-        auto process_row = [&](float* row, const float* proj_row, float u_base, float du) {
+        auto process_row = [&](float* CT_RESTRICT row,
+                               const float* CT_RESTRICT proj_row,
+                               float u_base, float du) {
             if (!proj_row) return;
             int x_start = 0, x_end = nx;
             if (du != 0.0f) {
@@ -122,11 +125,10 @@ void OptimizedBackprojectionCPU::reconstruct(Volume& volume,
             if (x_start >= x_end) return;
 
             // Основной цикл: BP_SIMD_WIDTH пикселей за итерацию.
-            // Компилятор авто-векторизует блок BP_SIMD_WIDTH = ширине регистра.
+            // CT_RESTRICT на row/proj_row → компилятор знает, что области не
+            // пересекаются, и может векторизовать без алиас-проверок.
             int x = x_start;
             for (; x <= x_end - BP_SIMD_WIDTH; x += BP_SIMD_WIDTH) {
-                // Развёртка вручную: BP_SIMD_WIDTH независимых acc за итерацию.
-                // Значения u0f..u(N-1)f вычисляются без зависимостей → SIMD.
                 #pragma omp simd
                 for (int d = 0; d < BP_SIMD_WIDTH; ++d) {
                     const float uf = static_cast<float>(x + d) * du + u_base;
@@ -136,7 +138,6 @@ void OptimizedBackprojectionCPU::reconstruct(Volume& volume,
                 }
             }
             // Хвостовой цикл: оставшиеся пиксели (< BP_SIMD_WIDTH)
-            // MSVC требует полной формы for (int ...) для #pragma omp simd
             const int x_tail = x;
             #pragma omp simd
             for (int xt = x_tail; xt < x_end; ++xt) {
