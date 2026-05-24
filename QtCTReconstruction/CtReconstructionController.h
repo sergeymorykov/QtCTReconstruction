@@ -52,8 +52,17 @@ public:
     Q_INVOKABLE void generateVolume();
     Q_INVOKABLE void startReconstruction();
     Q_INVOKABLE void savePng(int z);
-    Q_INVOKABLE void loadPointCloud();
+    // Экспортирует ВСЕ срезы реконструкции как slice_0000.png … slice_NNNN.png
+    // в выбранную пользователем директорию.
+    Q_INVOKABLE void exportAllReconstructionPng();
+    // Открывает file dialog, парсит .npy/.ply/.csv → m_loadedCloud.
+    // Возвращает true, если облако успешно загружено.
+    Q_INVOKABLE bool loadPointCloud();
     Q_INVOKABLE void extractAndFillPointCloud(QObject* geometry);
+    // Альтернатива extractAndFillPointCloud: заливает в geometry ранее
+    // загруженное с диска облако (после loadPointCloud()).
+    Q_INVOKABLE void fillFromLoadedCloud(QObject* geometry);
+    Q_INVOKABLE bool hasLoadedCloud() const;
 
     void setCurrentZ(int z);
     void setFilterType(int type);
@@ -144,6 +153,10 @@ private:
     int m_backendType = 1; // 0=Serial,1=OpenMP,2=CUDA,3=Hybrid (см. BackendFactory::BackendType)
     bool m_asBuffer = true;
     int m_volumeSize = 1024;
+
+    // Облако точек, загруженное с диска через loadPointCloud(). Используется
+    // PointCloudWindow при useLoadedCloud=true вместо извлечения из текущего тома.
+    ct::PointCloud m_loadedCloud;
 
     QPointer<QFutureWatcher<ReconstructionResult>> m_activeWatcher;
 

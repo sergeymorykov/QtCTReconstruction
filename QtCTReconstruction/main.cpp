@@ -1,4 +1,8 @@
-#include <QGuiApplication>
+// QApplication (не QGuiApplication!) обязателен — QFileDialog и любые другие
+// QWidget-based диалоги (open/save file, message box) требуют QApplication.
+// Без неё первый же QFileDialog::getOpenFileName/getExistingDirectory падает с
+// фатальной ошибкой "Cannot create a QWidget without QApplication".
+#include <QApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 
@@ -25,7 +29,7 @@ int main(int argc, char *argv[])
     // иначе он выбирает D3D11 по умолчанию → ошибка "Failed to create input layout"
     qputenv("QT3D_RENDERER", "opengl");
 
-    QGuiApplication app(argc, argv);
+    QApplication app(argc, argv);
 
     // Create the reconstruction controller
     CtReconstructionController controller;

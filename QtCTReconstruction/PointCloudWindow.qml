@@ -16,6 +16,10 @@ Window {
     title: "3D Point Cloud Debug Viewer"
 
     property var ctController
+    // Если true — заливаем заранее загруженное облако через fillFromLoadedCloud(),
+    // вместо извлечения из текущего тома через extractAndFillPointCloud().
+    // Устанавливается из main.qml при открытии окна по кнопке "Load Point Cloud".
+    property bool useLoadedCloud: false
 
     // Объект, хранящий состояние камеры
     QtObject {
@@ -174,8 +178,13 @@ Window {
         onTriggered: {
             if (rootWindow.ctController) {
                 try {
-                    rootWindow.ctController.extractAndFillPointCloud(cloudGeometry)
-                    console.log("Point cloud data sent to geometry")
+                    if (rootWindow.useLoadedCloud) {
+                        rootWindow.ctController.fillFromLoadedCloud(cloudGeometry)
+                        console.log("Loaded point cloud sent to geometry")
+                    } else {
+                        rootWindow.ctController.extractAndFillPointCloud(cloudGeometry)
+                        console.log("Extracted point cloud sent to geometry")
+                    }
                 } catch (e) {
                     console.error("Failed to initialize point cloud:", e)
                     errorLabel.visible = true

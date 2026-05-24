@@ -8,11 +8,15 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QFile>
 #include <QFileDialog>
 #include <QFuture>
 #include <QGuiApplication>
 #include <QImage>
 #include <QMutexLocker>
+#include <QRegularExpression>
+#include <QStringList>
+#include <QTextStream>
 #include <QtConcurrent/QtConcurrentRun>
 #include "IReconstructionBackend.h"
 #include "PointCloudGeometry.h"
@@ -173,6 +177,20 @@ void CtReconstructionController::setVolumeSize(int size) {
 }
 
 
+// Конвертирует ARGB QImage в Grayscale8 PNG-готовый QImage (как раньше делал savePng).
+// Вынесено, чтобы не дублировать в одиночном и пакетном путях экспорта.
+static QImage toGrayscalePngImage(const QImage& src) {
+    QImage target(src.width(), src.height(), QImage::Format_Grayscale8);
+    for (int y = 0; y < src.height(); ++y) {
+        const QRgb* srcRow = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        uchar* dstRow = target.scanLine(y);
+        for (int x = 0; x < src.width(); ++x) {
+            dstRow[x] = static_cast<uchar>(qGray(srcRow[x]));
+        }
+    }
+    return target;
+}
+
 void CtReconstructionController::savePng(int z) {
     if (!m_ready) return;
 
@@ -185,20 +203,390 @@ void CtReconstructionController::savePng(int z) {
 
     QImage img = getImage(ImageKind::Reconstruction, targetZ);
     if (!img.isNull()) {
-        QImage target(img.width(), img.height(), QImage::Format_Grayscale8);
-        for (int y = 0; y < img.height(); ++y) {
-            const QRgb* srcRow = reinterpret_cast<const QRgb*>(img.constScanLine(y));
-            uchar* dstRow = target.scanLine(y);
-            for (int x = 0; x < img.width(); ++x) {
-                dstRow[x] = static_cast<uchar>(qGray(srcRow[x]));
-            }
-        }
-        target.save(dir + QString("/slice_%1.png").arg(targetZ, 4, 10, QChar('0')));
+        toGrayscalePngImage(img).save(dir + QString("/slice_%1.png").arg(targetZ, 4, 10, QChar('0')));
     }
 }
 
-void CtReconstructionController::loadPointCloud() {
-    qDebug() << "[CT] Load Point Cloud not implemented fully here yet";
+void CtReconstructionController::exportAllReconstructionPng() {
+    if (!m_ready) {
+        qDebug() << "[CT] exportAllReconstructionPng: reconstruction not ready";
+        return;
+    }
+
+    QString outputDirQ = QCoreApplication::applicationDirPath() + "/data/output/slices";
+    QString dir = QFileDialog::getExistingDirectory(nullptr, "Select Output Directory for all slices", outputDirQ);
+    if (dir.isEmpty()) return;
+
+    int totalZ;
+    {
+        QMutexLocker lock(&m_mutex);
+        totalZ = m_maxZ + 1;
+        if (!m_reconstructionImagesPtr || m_reconstructionImagesPtr->empty()) {
+            qDebug() << "[CT] exportAllReconstructionPng: no reconstruction images";
+            return;
+        }
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    int written = 0;
+    for (int z = 0; z < totalZ; ++z) {
+        QImage img = getImage(ImageKind::Reconstruction, z);
+        if (img.isNull()) continue;
+        const QString path = dir + QString("/slice_%1.png").arg(z, 4, 10, QChar('0'));
+        if (toGrayscalePngImage(img).save(path)) {
+            ++written;
+        }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    qDebug() << "[CT] exportAllReconstructionPng: saved" << written << "of" << totalZ
+             << "slices in" << secs << "s to" << dir;
+}
+
+// ============================================================
+//  Point cloud loading: NPY / PLY (ASCII) / CSV
+// ============================================================
+
+// PLY ASCII парсер: ищет element vertex N, property float x/y/z + одно скалярное
+// свойство для HU (intensity / scalar / value / red — берётся первое подходящее).
+// Поддерживает только ASCII PLY с float-свойствами; binary не поддерживается.
+static bool loadPointCloudPLY(const QString& path, ct::PointCloud& out) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return false;
+    QTextStream ts(&f);
+
+    QString line = ts.readLine().trimmed();
+    if (line != "ply") return false;
+    line = ts.readLine().trimmed();
+    if (!line.startsWith("format ascii")) {
+        qDebug() << "[CT] PLY loader: only ascii format supported, got:" << line;
+        return false;
+    }
+
+    int vertexCount = 0;
+    QStringList props;
+    bool inVertex = false;
+    while (!ts.atEnd()) {
+        line = ts.readLine().trimmed();
+        if (line.startsWith("comment")) continue;
+        if (line.startsWith("element vertex")) {
+            vertexCount = line.section(' ', 2, 2).toInt();
+            inVertex = true;
+            continue;
+        }
+        if (line.startsWith("element ")) {
+            inVertex = false;
+            continue;
+        }
+        if (inVertex && line.startsWith("property ")) {
+            props.append(line.section(' ', -1, -1));  // property name
+        }
+        if (line == "end_header") break;
+    }
+    if (vertexCount <= 0) return false;
+
+    const int ix = props.indexOf("x");
+    const int iy = props.indexOf("y");
+    const int iz = props.indexOf("z");
+    if (ix < 0 || iy < 0 || iz < 0) return false;
+    int ihu = -1;
+    for (const auto& name : { QString("hu"), QString("intensity"), QString("scalar"),
+                              QString("value"), QString("density"), QString("red") }) {
+        ihu = props.indexOf(name);
+        if (ihu >= 0) break;
+    }
+
+    out.clear();
+    out.reserve(vertexCount);
+    const int totalProps = props.size();
+    for (int i = 0; i < vertexCount && !ts.atEnd(); ++i) {
+        const QStringList toks = ts.readLine().split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+        if (toks.size() < totalProps) continue;
+        ct::Point p;
+        p.x  = toks[ix].toFloat();
+        p.y  = toks[iy].toFloat();
+        p.z  = toks[iz].toFloat();
+        p.hu = (ihu >= 0) ? toks[ihu].toFloat() : 0.0f;
+        out.push_back(p);
+    }
+    return !out.empty();
+}
+
+// CSV парсер: каждая строка "x,y,z[,hu]" (разделитель — запятая или ;).
+// Если первая строка не парсится как числа — считаем её header и пропускаем.
+static bool loadPointCloudCSV(const QString& path, ct::PointCloud& out) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return false;
+    QTextStream ts(&f);
+
+    out.clear();
+    bool firstLine = true;
+    while (!ts.atEnd()) {
+        QString line = ts.readLine().trimmed();
+        if (line.isEmpty()) continue;
+        const QStringList toks = line.split(QRegularExpression("[,;\\s]+"), Qt::SkipEmptyParts);
+        if (toks.size() < 3) continue;
+        bool okX = false, okY = false, okZ = false;
+        const float x = toks[0].toFloat(&okX);
+        const float y = toks[1].toFloat(&okY);
+        const float z = toks[2].toFloat(&okZ);
+        if (!okX || !okY || !okZ) {
+            if (firstLine) { firstLine = false; continue; }  // header
+            continue;
+        }
+        firstLine = false;
+        ct::Point p;
+        p.x = x; p.y = y; p.z = z;
+        p.hu = (toks.size() >= 4) ? toks[3].toFloat() : 0.0f;
+        out.push_back(p);
+    }
+    return !out.empty();
+}
+
+// Растеризация разреженного облака точек в плотный воксельный том N_tgt³.
+//
+// Старая версия маппила каждую точку в один воксель target-сетки через
+// bbox-нормализацию. При N_tgt > N_source оставались зазоры в регулярных
+// позициях → moire/чёрный экран на 512³/1024³. При N_tgt < N_source наоборот,
+// несколько точек давили друг друга в одном вокселе.
+//
+// Новый алгоритм — двухпроходный resample:
+//   1. По bbox облака восстанавливаем размер ИСХОДНОЙ сетки N_src
+//      (для облаков от np.where(...) это размер MRI/CT-сетки, типично 192-256).
+//   2. Растеризуем точки в плотный том N_src³ — каждый source-воксель получает
+//      своё HU-значение, пустые остаются 0 (это были "фон/воздух", отсечённые
+//      порогом в Python-скрипте).
+//   3. Resample N_src³ → N_tgt³ через nearest-neighbor (по центрам вокселей).
+//      Upsample = replication (каждый source-воксель копируется в k³ target,
+//      где k = N_tgt/N_src), нет дырок. Downsample = decimation.
+//
+// Память: source-буфер = N_src³ × 4 байт. Для типичной MRI 256³ это 64 МБ,
+// 512³ — 512 МБ. Если облако имеет очень большой bbox — может занять много.
+static void rasterizeCloudToVolume(const ct::PointCloud& cloud, int N_tgt, ct::Volume& out) {
+    out.assign((size_t)N_tgt, (size_t)N_tgt, (size_t)N_tgt, 0.0f);
+    if (cloud.empty() || N_tgt <= 0) return;
+
+    // 1. Bbox облака.
+    float xmin = cloud[0].x, xmax = xmin;
+    float ymin = cloud[0].y, ymax = ymin;
+    float zmin = cloud[0].z, zmax = zmin;
+    for (const auto& p : cloud) {
+        xmin = std::min(xmin, p.x); xmax = std::max(xmax, p.x);
+        ymin = std::min(ymin, p.y); ymax = std::max(ymax, p.y);
+        zmin = std::min(zmin, p.z); zmax = std::max(zmax, p.z);
+    }
+    const float xrange = xmax - xmin;
+    const float yrange = ymax - ymin;
+    const float zrange = zmax - zmin;
+    const float maxRange = std::max({xrange, yrange, zrange});
+
+    // 2. Восстановление исходного размера сетки. Для облаков от np.where(...)
+    //    координаты — целые индексы, и max + 1 даёт точный размер MRI-сетки.
+    //    Для произвольных координат — округляем bbox в большую сторону.
+    int N_src = std::max(4, (int)std::round(maxRange) + 1);
+    // Ограничение по памяти: 1024³ × 4 = 4 ГБ. Для облаков с очень большим
+    // bbox обрезаем N_src — это понизит детализацию, но не свалит процесс.
+    constexpr int N_SRC_LIMIT = 1024;
+    if (N_src > N_SRC_LIMIT) {
+        qDebug() << "[CT] rasterizeCloudToVolume: clamping N_src" << N_src
+                 << "→" << N_SRC_LIMIT << "(bbox too large)";
+        N_src = N_SRC_LIMIT;
+    }
+    qDebug() << "[CT] rasterizeCloudToVolume: bbox" << xrange << "×" << yrange << "×" << zrange
+             << "→ N_src=" << N_src << ", N_tgt=" << N_tgt;
+
+    // 3. Растеризация в плотный source-том. Координаты bbox-relative,
+    //    масштаб точек в [0, N_src-1].
+    const size_t srcSize = (size_t)N_src * N_src * N_src;
+    std::vector<float> src;
+    try {
+        src.assign(srcSize, 0.0f);
+    } catch (const std::bad_alloc&) {
+        qDebug() << "[CT] rasterizeCloudToVolume: bad_alloc for source" << N_src
+                 << "³ (~ " << (srcSize * 4) / (1024 * 1024) << "MB)";
+        return;
+    }
+
+    const float srcScale = (maxRange > 1e-6f) ? ((float)(N_src - 1) / maxRange) : 1.0f;
+    for (const auto& p : cloud) {
+        int sx = (int)((p.x - xmin) * srcScale + 0.5f);
+        int sy = (int)((p.y - ymin) * srcScale + 0.5f);
+        int sz = (int)((p.z - zmin) * srcScale + 0.5f);
+        if (sx < 0) sx = 0; else if (sx >= N_src) sx = N_src - 1;
+        if (sy < 0) sy = 0; else if (sy >= N_src) sy = N_src - 1;
+        if (sz < 0) sz = 0; else if (sz >= N_src) sz = N_src - 1;
+        src[((size_t)sz * N_src + sy) * N_src + sx] = p.hu;
+    }
+
+    // 4. Resample source → target через nearest-neighbor по центрам вокселей.
+    //    Маппинг: tx = центр target-вокселя в [0, N_tgt) → s = (tx + 0.5) * N_src / N_tgt.
+    //    Для N_tgt > N_src: каждый source-воксель копируется ⌈N_tgt/N_src⌉^3 раз
+    //    в target — нет дырок (которые давали moire в старом варианте).
+    const float ratio = (float)N_src / (float)N_tgt;
+    #pragma omp parallel for
+    for (int tz = 0; tz < N_tgt; ++tz) {
+        int sz = (int)((tz + 0.5f) * ratio);
+        if (sz < 0) sz = 0; else if (sz >= N_src) sz = N_src - 1;
+        for (int ty = 0; ty < N_tgt; ++ty) {
+            int sy = (int)((ty + 0.5f) * ratio);
+            if (sy < 0) sy = 0; else if (sy >= N_src) sy = N_src - 1;
+            for (int tx = 0; tx < N_tgt; ++tx) {
+                int sx = (int)((tx + 0.5f) * ratio);
+                if (sx < 0) sx = 0; else if (sx >= N_src) sx = N_src - 1;
+                out.data[((size_t)tz * N_tgt + ty) * N_tgt + tx] =
+                    src[((size_t)sz * N_src + sy) * N_src + sx];
+            }
+        }
+    }
+}
+
+bool CtReconstructionController::loadPointCloud() {
+    const QString defaultDir = QCoreApplication::applicationDirPath() + "/data/output";
+    const QString path = QFileDialog::getOpenFileName(
+        nullptr, "Load Point Cloud or Volume", defaultDir,
+        "Point cloud / Volume NPY (*.npy *.ply *.csv);;NumPy (*.npy);;PLY ASCII (*.ply);;CSV (*.csv);;All files (*)");
+    if (path.isEmpty()) return false;
+
+    // ============================================================
+    // Распознаём формат: dense volume NPY (shape Z,Y,X) или sparse
+    // point cloud (NPY shape N×4, PLY, CSV).
+    //
+    // Volume path: данные кладутся прямо в стандартный NPY, который
+    //   reconstructionTask читает. m_loadedCloud остаётся пустым →
+    //   QML не открывает 3D viewer (нечего показывать).
+    //
+    // Cloud path: точки сохраняются в m_loadedCloud (для 3D viewer'а)
+    //   и растеризуются в том через rasterizeCloudToVolume.
+    // ============================================================
+    ct::PointCloud cloud;
+    ct::Volume volume;
+    bool gotCloud  = false;
+    bool gotVolume = false;
+    const QString lower = path.toLower();
+
+    if (lower.endsWith(".npy")) {
+        // Сначала пробуем как point cloud (быстрая проверка по header'у).
+        if (ct::FileIO::loadPointCloudNPY(path.toStdString(), cloud)) {
+            gotCloud = true;
+        } else if (ct::FileIO::loadVolumeNPY(path.toStdString(), volume, /*input_is_xyz_layout=*/false)) {
+            gotVolume = true;
+        }
+    } else if (lower.endsWith(".ply")) {
+        gotCloud = loadPointCloudPLY(path, cloud);
+    } else if (lower.endsWith(".csv")) {
+        gotCloud = loadPointCloudCSV(path, cloud);
+    } else {
+        // Без явного расширения — пробуем все парсеры по очереди.
+        if (ct::FileIO::loadPointCloudNPY(path.toStdString(), cloud)) gotCloud = true;
+        else if (ct::FileIO::loadVolumeNPY(path.toStdString(), volume, false)) gotVolume = true;
+        else if (loadPointCloudPLY(path, cloud)) gotCloud = true;
+        else if (loadPointCloudCSV(path, cloud)) gotCloud = true;
+    }
+
+    if (!gotCloud && !gotVolume) {
+        qDebug() << "[CT] loadPointCloud: failed to parse" << path;
+        return false;
+    }
+    if (gotCloud && cloud.empty()) {
+        qDebug() << "[CT] loadPointCloud: empty cloud in" << path;
+        return false;
+    }
+
+    // ensureDirectory — НЕ рекурсивный, создаём data и data/output отдельно.
+    const QString appDir   = QCoreApplication::applicationDirPath();
+    const QString dataDir  = appDir + "/data";
+    const QString outDir   = dataDir + "/output";
+    ct::utils::ensureDirectory(toWStringBackslashPath(dataDir));
+    ct::utils::ensureDirectory(toWStringBackslashPath(outDir));
+
+    int volSize = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    if (gotVolume) {
+        // ---------- VOLUME PATH ----------
+        // Подбираем m_volumeSize под загруженный том. Если том не кубический,
+        // используем max-измерение и пишем предупреждение (FBP в апп ждёт куб).
+        const size_t w = volume.width, h = volume.height, d = volume.depth;
+        if (w != h || h != d) {
+            qDebug() << "[CT] loadPointCloud: WARNING — volume is non-cubic"
+                     << w << "×" << h << "×" << d << "; FBP expects cube, taking max dim";
+        }
+        const size_t N = std::max({w, h, d});
+        volSize = (int)N;
+
+        {
+            QMutexLocker lock(&m_mutex);
+            m_loadedCloud.clear();   // нет облака — 3D viewer не открываем
+            m_volumeSize = volSize;
+        }
+        emit volumeSizeChanged();
+        qDebug() << "[CT] loadPointCloud: loaded dense volume" << w << "×" << h << "×" << d
+                 << "from" << path << "; saving as standard NPY for reconstruction";
+
+        const QString npyPath = outDir + "/synthetic_brain_hu_cxx_" + QString::number(volSize) + ".npy";
+        if (!ct::FileIO::saveVolumeNPY(volume, npyPath.toStdString())) {
+            qDebug() << "[CT] loadPointCloud: failed to save volume to" << npyPath;
+            return false;
+        }
+    } else {
+        // ---------- CLOUD PATH ----------
+        {
+            QMutexLocker lock(&m_mutex);
+            m_loadedCloud = std::move(cloud);
+            volSize = m_volumeSize;
+        }
+        qDebug() << "[CT] loadPointCloud: loaded" << m_loadedCloud.size() << "points from" << path;
+
+        ct::Volume vol;
+        rasterizeCloudToVolume(m_loadedCloud, volSize, vol);
+
+        const QString npyPath = outDir + "/synthetic_brain_hu_cxx_" + QString::number(volSize) + ".npy";
+        if (!ct::FileIO::saveVolumeNPY(vol, npyPath.toStdString())) {
+            qDebug() << "[CT] loadPointCloud: failed to save rasterized volume to" << npyPath;
+            // Облако загружено — 3D viewer откроется; реконструкция не активна.
+            return true;
+        }
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    qDebug() << "[CT] loadPointCloud: prepared volume of size" << volSize << "³ in"
+             << std::chrono::duration<double>(t1 - t0).count() << "s";
+
+    {
+        QMutexLocker lock(&m_mutex);
+        m_hasVolume = true;
+        m_ready = false;   // предыдущая реконструкция (если была) больше не валидна
+        if (m_originalImagesPtr) m_originalImagesPtr->clear();
+        if (m_sinogramImagesPtr) m_sinogramImagesPtr->clear();
+        if (m_reconstructionImagesPtr) m_reconstructionImagesPtr->clear();
+        if (m_differenceImagesPtr) m_differenceImagesPtr->clear();
+    }
+    emit hasVolumeChanged();
+    emit readyChanged();
+    return true;
+}
+
+bool CtReconstructionController::hasLoadedCloud() const {
+    QMutexLocker lock(&m_mutex);
+    return !m_loadedCloud.empty();
+}
+
+void CtReconstructionController::fillFromLoadedCloud(QObject* geometry) {
+    auto* geom = qobject_cast<PointCloudGeometry*>(geometry);
+    if (!geom) {
+        qDebug() << "[CT] fillFromLoadedCloud: cannot cast geometry";
+        return;
+    }
+    ct::PointCloud localCopy;
+    {
+        QMutexLocker lock(&m_mutex);
+        if (m_loadedCloud.empty()) {
+            qDebug() << "[CT] fillFromLoadedCloud: no loaded cloud (call loadPointCloud first)";
+            return;
+        }
+        localCopy = m_loadedCloud;
+    }
+    geom->setPointCloud(localCopy);
 }
 
 void CtReconstructionController::extractAndFillPointCloud(QObject* geometry) {

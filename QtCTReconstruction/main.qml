@@ -139,14 +139,37 @@ Window {
             Item { Layout.fillWidth: true }
 
             Button {
-                text: "Load Point Cloud"
-                onClicked: controller.loadPointCloud()
+                text: "Load Point Cloud / Volume"
+                // Загрузка с диска не зависит от состояния реконструкции —
+                // кнопка доступна всегда, включая старт программы.
+                onClicked: {
+                    // C++ распознаёт автоматически: dense volume NPY (Z,Y,X) или
+                    // sparse point cloud (NPY N×4 / PLY / CSV). Volume сразу
+                    // готов для реконструкции; cloud дополнительно показывается
+                    // в 3D viewer'е.
+                    if (controller.loadPointCloud() && controller.hasLoadedCloud()) {
+                        var component = Qt.createComponent("PointCloudWindow.qml");
+                        if (component.status === Component.Ready) {
+                            if (root.pointCloudWindow) {
+                                root.pointCloudWindow.destroy();
+                            }
+                            root.pointCloudWindow = component.createObject(null, {
+                                "ctController": controller,
+                                "useLoadedCloud": true
+                            });
+                            root.pointCloudWindow.show();
+                        } else if (component.status === Component.Error) {
+                            console.error("Error loading PointCloudWindow:", component.errorString());
+                        }
+                    }
+                }
                 implicitHeight: 30
             }
 
             Button {
                 text: "Export PNG"
-                onClicked: controller.savePng(-1)
+                enabled: controller.ready
+                onClicked: controller.exportAllReconstructionPng()
                 implicitHeight: 30
             }
 
