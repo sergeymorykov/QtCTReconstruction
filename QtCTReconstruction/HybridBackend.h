@@ -27,7 +27,6 @@
 
 #include <cufft.h>
 #include <cuda_runtime.h>
-#include <future>
 #include <mutex>
 
 namespace ct {
@@ -69,8 +68,9 @@ private:
     mutable float*        m_d_filter     = nullptr;
     mutable float*        m_d_cos        = nullptr;
     mutable float*        m_d_sin        = nullptr;
-    mutable float*        m_d_min_hu     = nullptr;   // [nz]
-    mutable float*        m_d_span       = nullptr;   // [nz]
+    mutable float*        m_d_min_hu     = nullptr;   // [nz] — заполняется на GPU в Этапе I, читается в Этапе II
+    mutable float*        m_d_span       = nullptr;   // [nz] — то же
+    mutable float*        m_d_slice_minmax = nullptr; // [2*nz] — raw (vmin, vmax) per slice, intermediate
     // Boundary tables на устройстве, ping-pong по slot'у
     mutable int*          m_d_umin[2]    = { nullptr, nullptr };
     mutable int*          m_d_umax[2]    = { nullptr, nullptr };

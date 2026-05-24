@@ -236,6 +236,31 @@ else()
     message(STATUS "[CT] CUDA Debug: standard mode (-G -g, kernels NON-optimised)")
 endif()
 
+# ============================================================
+# Release с PDB-символами (для отладки heap-corruption / crash dumps).
+# /Zi   — C++ компилятор пишет debug info в .pdb
+# /DEBUG — линкер генерирует .pdb рядом с .exe
+# /OPT:REF /OPT:ICF — сохраняем Release-оптимизации (по умолчанию /DEBUG их
+#                     отключает; явное /OPT:REF /OPT:ICF возвращает).
+# Для CUDA host-стороны: -Xcompiler=/Zi.
+# ============================================================
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/Zi>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-Xcompiler=/Zi>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:RelWithDebInfo>>:/Zi>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:-Xcompiler=/Zi>
+    )
+    target_link_options(${PROJECT_NAME} PRIVATE
+        $<$<CONFIG:Release>:/DEBUG>
+        $<$<CONFIG:Release>:/OPT:REF>
+        $<$<CONFIG:Release>:/OPT:ICF>
+        $<$<CONFIG:RelWithDebInfo>:/DEBUG>
+        $<$<CONFIG:RelWithDebInfo>:/OPT:REF>
+        $<$<CONFIG:RelWithDebInfo>:/OPT:ICF>
+    )
+endif()
+
 if(WIN32)
     find_program(WINDEPLOYQT windeployqt 
         HINTS "${Qt6Core_DIR}/../../../bin" 

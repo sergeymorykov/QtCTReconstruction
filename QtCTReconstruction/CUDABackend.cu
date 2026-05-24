@@ -453,10 +453,14 @@ void CUDABackend::ensurePinnedAndStreams(size_t slice_pixels) const {
 
 void CUDABackend::ensureFilter(size_t padded_size, ReconstructionParams::FilterType type) const {
     if (m_filterSize == padded_size && m_filterType == type) return;
+    // FilterDesign возвращает спектр размера padded_size/2 + 1 (R2C-форма),
+    // НЕ padded_size. Аллоцируем и копируем ровно столько, сколько фактически
+    // лежит в векторе — иначе cudaMemcpy читает за концом std::vector.
     std::vector<float> cpu_filter = FilterDesign::createFilter(padded_size, type);
+    const size_t bytes = cpu_filter.size() * sizeof(float);
     if (m_d_filter) cudaFree(m_d_filter);
-    CUDA_CHECK(cudaMalloc(&m_d_filter, padded_size * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(m_d_filter, cpu_filter.data(), padded_size * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&m_d_filter, bytes));
+    CUDA_CHECK(cudaMemcpy(m_d_filter, cpu_filter.data(), bytes, cudaMemcpyHostToDevice));
     m_filterSize = padded_size;
     m_filterType = type;
 }

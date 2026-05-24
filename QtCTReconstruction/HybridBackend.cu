@@ -12,7 +12,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <future>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -28,6 +27,7 @@
 #include <thrust/count.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -71,6 +71,96 @@ namespace {
 __global__ void hbNormalizeKernel(float* __restrict__ data, int n, float vmin, float inv_span) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) data[i] = (data[i] - vmin) * inv_span;
+}
+
+// Pure-GPU нормализация: vmin/vmax читаются из device-памяти (результат async-thrust на стриме).
+// Это позволяет всему Этапу I быть async — никаких host-side sync на per-slice минмаксе.
+__global__ void hbNormalizeFromDevicePairKernel(float* __restrict__ data, int n,
+                                                const float* __restrict__ d_vminmax) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float vmin = d_vminmax[0];
+    float vmax = d_vminmax[1];
+    float span = vmax - vmin;
+    if (span < 1e-6f) span = 1.0f;
+    data[i] = (data[i] - vmin) / span;
+}
+
+// Конвертирует (vmin, vmax)[nz] → min[nz], span[nz] для последующего denormalize в Этапе II.
+// Запускается один раз после всех Radon-кернелов в Этапе I.
+__global__ void hbMinMaxToMinSpanKernel(const float* __restrict__ minmax,
+                                         float* __restrict__ d_min,
+                                         float* __restrict__ d_span,
+                                         int nz) {
+    int z = blockIdx.x * blockDim.x + threadIdx.x;
+    if (z >= nz) return;
+    float vmin = minmax[2 * z + 0];
+    float vmax = minmax[2 * z + 1];
+    float span = vmax - vmin;
+    if (span < 1e-6f) span = 1.0f;
+    d_min[z]  = vmin;
+    d_span[z] = span;
+}
+
+// ---------- Gather Radon (без atomicAdd) ----------
+// Поток = (bin, angle), интегрирует ОДИН луч через изображение bilinear sampling'ом.
+// Каждый поток пишет в одну ячейку синограммы → coalesced writes, ноль атомиков.
+// Аналог CUDABackend::radonForwardGatherKernel, но с Hybrid-layout:
+//   sino[(a * depth + z_slice) * detector_bins + bin]
+// (в CUDABackend: sino[(z_slice * num_angles + a) * detector_bins + bin])
+__global__ void hbRadonGatherKernel(
+    const float* __restrict__ image,
+    float*       __restrict__ sino,
+    int width, int height,
+    int num_angles, int detector_bins,
+    float cx, float cy,
+    float detector_center,
+    int z_slice, int depth)
+{
+    int bin = blockIdx.x * blockDim.x + threadIdx.x;
+    int a   = blockIdx.y * blockDim.y + threadIdx.y;
+    if (bin >= detector_bins || a >= num_angles) return;
+
+    float c = hb_cos_table[a];
+    float s = hb_sin_table[a];
+    float u_signed = (float)bin - detector_center;
+
+    // Базовая точка луча и направление, перпендикулярное проекции.
+    // Согласовано со scatter-формулой: u = (x-cx)*c - (y-cy)*s + det_center.
+    float bx = cx + u_signed * c;
+    float by = cy - u_signed * s;
+    float dx = s;
+    float dy = c;
+
+    float half = 0.5f * sqrtf((float)(width * width + height * height));
+    int n_samples = (int)(2.0f * half) + 1;
+
+    float sum = 0.0f;
+    float t = -half;
+    #pragma unroll 4
+    for (int i = 0; i < n_samples; ++i, t += 1.0f) {
+        float x = bx + t * dx;
+        float y = by + t * dy;
+
+        int x0 = (int)floorf(x);
+        int y0 = (int)floorf(y);
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+        float fx = x - (float)x0;
+        float fy = y - (float)y0;
+
+        float v00 = (x0 >= 0 && x0 < width  && y0 >= 0 && y0 < height) ? image[y0 * width + x0] : 0.0f;
+        float v10 = (x1 >= 0 && x1 < width  && y0 >= 0 && y0 < height) ? image[y0 * width + x1] : 0.0f;
+        float v01 = (x0 >= 0 && x0 < width  && y1 >= 0 && y1 < height) ? image[y1 * width + x0] : 0.0f;
+        float v11 = (x1 >= 0 && x1 < width  && y1 >= 0 && y1 < height) ? image[y1 * width + x1] : 0.0f;
+
+        sum += (1.0f - fx) * (1.0f - fy) * v00
+             +         fx  * (1.0f - fy) * v10
+             + (1.0f - fx) *         fy  * v01
+             +         fx  *         fy  * v11;
+    }
+    // Hybrid layout: row = a * depth + z_slice, width = detector_bins
+    sino[((size_t)a * depth + z_slice) * detector_bins + bin] = sum;
 }
 
 // vol[(z*nxy)+i] = val * pi_scale * span[z] + min_hu[z]
@@ -355,7 +445,7 @@ void HybridBackend::releaseAll() const {
         if (m_h_umax[s])      { cudaFreeHost(m_h_umax[s]);  m_h_umax[s]      = nullptr; }
     }
     free_if(m_d_filter); free_if(m_d_cos); free_if(m_d_sin);
-    free_if(m_d_min_hu); free_if(m_d_span);
+    free_if(m_d_min_hu); free_if(m_d_span); free_if(m_d_slice_minmax);
     free_if(m_d_single_slice); free_if(m_d_single_sino);
     m_singleSliceCap = m_singleSinoCap = 0;
     if (m_d_spectrum) { cudaFree(m_d_spectrum); m_d_spectrum = nullptr; }
@@ -437,7 +527,13 @@ void HybridBackend::ensureStreams() const {
 void HybridBackend::ensureWorkspace(size_t w, size_t h, size_t d,
                                     size_t num_angles, size_t bins,
                                     size_t chunk_z) const {
-    size_t vol_req  = w * h * d;
+    // [MEMORY] m_d_vol_in/out — только под ОДИН чанк, не весь объём.
+    //   Раньше: 2 * w*h*d (для 1024³ = 8 ГБ) → не влезало в 6ГБ VRAM,
+    //           WDDM начинал свопить device-память через PCIe → backproj
+    //           замедлялся в 25× (~130с вместо 5с).
+    //   Сейчас: 2 * w*h*chunk_z (для 1024² × 64 = 512 МБ). Этап I стримит
+    //           вход чанками с CPU, Этап II пишет выход по чанкам.
+    size_t chunk_vol_req = w * h * chunk_z;
     size_t sino_req = num_angles * d * bins;
 
     const size_t sq       = static_cast<size_t>(std::ceil(std::sqrt(2.0) * (double)bins));
@@ -448,13 +544,13 @@ void HybridBackend::ensureWorkspace(size_t w, size_t h, size_t d,
     const size_t pp_req     = chunk_rows * proj_pad;
     const size_t spec_req   = chunk_rows * complex_size;
 
-    if (m_volCap < vol_req) {
+    if (m_volCap < chunk_vol_req) {
         if (m_d_vol_in)  { cudaFree(m_d_vol_in);  m_d_vol_in  = nullptr; }
         if (m_d_vol_out) { cudaFree(m_d_vol_out); m_d_vol_out = nullptr; }
         m_volCap = 0;
-        GPUCHECK(cudaMalloc(&m_d_vol_in,  vol_req * sizeof(float)));
-        GPUCHECK(cudaMalloc(&m_d_vol_out, vol_req * sizeof(float)));
-        m_volCap = vol_req;
+        GPUCHECK(cudaMalloc(&m_d_vol_in,  chunk_vol_req * sizeof(float)));
+        GPUCHECK(cudaMalloc(&m_d_vol_out, chunk_vol_req * sizeof(float)));
+        m_volCap = chunk_vol_req;
     }
     if (m_sinoCap < sino_req) {
         if (m_d_all_sinos) { cudaFree(m_d_all_sinos); m_d_all_sinos = nullptr; }
@@ -487,37 +583,20 @@ void HybridBackend::ensureWorkspace(size_t w, size_t h, size_t d,
         m_spectrumCap = spec_req;
     }
 
-    if (m_filtCap < pp_req) {
-        for (int s = 0; s < 2; ++s) {
-            if (m_h_filt[s]) { cudaFreeHost(m_h_filt[s]); m_h_filt[s] = nullptr; }
-            GPUCHECK(cudaHostAlloc(&m_h_filt[s], pp_req * sizeof(float),
-                                   cudaHostAllocPortable));
-        }
-        m_filtCap = pp_req;
-    }
-
-    // Boundary buffers (per-angle × full depth — kernel читает по глобальному z).
-    const size_t bnd_full = num_angles * d;
-    if (m_bndCap < bnd_full) {
-        for (int s = 0; s < 2; ++s) {
-            if (m_d_umin[s]) { cudaFree(m_d_umin[s]); m_d_umin[s] = nullptr; }
-            if (m_d_umax[s]) { cudaFree(m_d_umax[s]); m_d_umax[s] = nullptr; }
-            if (m_h_umin[s]) { cudaFreeHost(m_h_umin[s]); m_h_umin[s] = nullptr; }
-            if (m_h_umax[s]) { cudaFreeHost(m_h_umax[s]); m_h_umax[s] = nullptr; }
-            GPUCHECK(cudaMalloc(&m_d_umin[s], bnd_full * sizeof(int)));
-            GPUCHECK(cudaMalloc(&m_d_umax[s], bnd_full * sizeof(int)));
-            GPUCHECK(cudaHostAlloc(&m_h_umin[s], bnd_full * sizeof(int), cudaHostAllocPortable));
-            GPUCHECK(cudaHostAlloc(&m_h_umax[s], bnd_full * sizeof(int), cudaHostAllocPortable));
-        }
-        m_bndCap = bnd_full;
-    }
+    // [SIMPLIFY] m_h_filt (pinned host буфер для D2H фильтрованного pad'а к CPU
+    // для air-boundary анализа) и m_d_umin/m_d_umax/m_h_umin/m_h_umax (boundary
+    // tables) больше не нужны — air-skip path отключён. Аллокацию убрали
+    // (экономия ~188 МБ pinned RAM на дефолтных параметрах). Сами поля
+    // оставлены в .h на случай возвращения air-skip'а в будущем.
 
     if (m_depthCap < d) {
-        if (m_d_min_hu) { cudaFree(m_d_min_hu); m_d_min_hu = nullptr; }
-        if (m_d_span)   { cudaFree(m_d_span);   m_d_span   = nullptr; }
+        if (m_d_min_hu)       { cudaFree(m_d_min_hu);       m_d_min_hu       = nullptr; }
+        if (m_d_span)         { cudaFree(m_d_span);         m_d_span         = nullptr; }
+        if (m_d_slice_minmax) { cudaFree(m_d_slice_minmax); m_d_slice_minmax = nullptr; }
         m_depthCap = 0;
         GPUCHECK(cudaMalloc(&m_d_min_hu, d * sizeof(float)));
         GPUCHECK(cudaMalloc(&m_d_span,   d * sizeof(float)));
+        GPUCHECK(cudaMalloc(&m_d_slice_minmax, 2 * d * sizeof(float)));
         m_depthCap = d;
     }
 }
@@ -525,10 +604,14 @@ void HybridBackend::ensureWorkspace(size_t w, size_t h, size_t d,
 void HybridBackend::ensureFilter(size_t padded_size,
                                   ReconstructionParams::FilterType type) const {
     if (m_filterSize == padded_size && m_filterType == type) return;
+    // FilterDesign возвращает спектр размера padded_size/2 + 1 (R2C-форма),
+    // НЕ padded_size. Аллоцируем и копируем ровно столько, сколько фактически
+    // лежит в векторе — иначе cudaMemcpy читает за концом std::vector.
     std::vector<float> cpu_f = FilterDesign::createFilter(padded_size, type);
+    const size_t bytes = cpu_f.size() * sizeof(float);
     if (m_d_filter) cudaFree(m_d_filter);
-    GPUCHECK(cudaMalloc(&m_d_filter, padded_size * sizeof(float)));
-    GPUCHECK(cudaMemcpy(m_d_filter, cpu_f.data(), padded_size * sizeof(float), cudaMemcpyHostToDevice));
+    GPUCHECK(cudaMalloc(&m_d_filter, bytes));
+    GPUCHECK(cudaMemcpy(m_d_filter, cpu_f.data(), bytes, cudaMemcpyHostToDevice));
     m_filterSize = padded_size;
     m_filterType = type;
 }
@@ -713,56 +796,100 @@ void HybridBackend::reconstructVolume(const Volume& input_volume,
     const float det_ctr = (float)(bins / 2);
 
     // ====================================================================
-    // ЭТАП I — Радон-проекция всего объёма на GPU.
+    // ЭТАП I — Радон-проекция объёма на GPU. Streaming + async.
+    //
+    // [MEMORY] Вход стримим CPU→GPU чанками по CHUNK_Z слайсов. m_d_vol_in
+    //   держит только один чанк (256 МБ для 1024², а не 4 ГБ за весь объём).
+    //   Это критично на consumer GPU с ≤6 ГБ VRAM, иначе WDDM начинает
+    //   свопить device-память → backproj в 25× медленнее.
+    //
+    // На каждый слайс:
+    //   1. thrust::minmax_element(par.on(stream)) — async, результат на device
+    //   2. DtoD copy (vmin, vmax) → m_d_slice_minmax[2*z..]
+    //   3. hbNormalizeFromDevicePairKernel — нормализация без host-sync
+    //   4. hbRadonGatherKernel — поток=(bin,a), без атомиков, coalesced writes
+    //      → пишет в правильный глобальный z в m_d_all_sinos
+    // После всех чанков — hbMinMaxToMinSpanKernel конвертирует (vmin,vmax)[nz]
+    // → (min[nz], span[nz]) для Этапа II.
     // ====================================================================
     auto t_sino_start = std::chrono::steady_clock::now();
 
-    const size_t vol_bytes = (size_t)nx * ny * nz * sizeof(float);
-    GPUCHECK(cudaMemcpy(m_d_vol_in, input_volume.data.data(), vol_bytes, cudaMemcpyHostToDevice));
-
-    std::vector<float> h_min(nz), h_span(nz);
     const int total_rows = na * nz;
-    GPUCHECK(cudaMemset(m_d_all_sinos, 0, (size_t)total_rows * bins * sizeof(float)));
+    GPUCHECK(cudaMemsetAsync(m_d_all_sinos, 0,
+                              (size_t)total_rows * bins * sizeof(float),
+                              m_stream_filt));
 
-    for (int z = 0; z < nz; ++z) {
-        float* d_slice = m_d_vol_in + (size_t)z * nx * ny;
-        int nxy = nx * ny;
+    dim3 blk_r(16, 16);
+    dim3 grd_r((bins + 15) / 16, (na + 15) / 16);
+    const int nxy = nx * ny;
+    const size_t slice_bytes = (size_t)nxy * sizeof(float);
 
-        thrust::device_ptr<float> dp(d_slice);
-        float vmin = *thrust::min_element(dp, dp + nxy);
-        float vmax = *thrust::max_element(dp, dp + nxy);
-        h_min[z]  = vmin;
-        float s   = vmax - vmin;
-        h_span[z] = (s < 1e-6f) ? 1.0f : s;
+    for (int chunk_z0 = 0; chunk_z0 < nz; chunk_z0 += CHUNK_Z) {
+        const int chunk_nz = std::min(CHUNK_Z, nz - chunk_z0);
 
-        float inv_s = 1.0f / h_span[z];
-        hbNormalizeKernel<<<(nxy + 255) / 256, 256>>>(d_slice, nxy, vmin, inv_s);
+        // H2D очередного чанка слайсов в m_d_vol_in (chunk-sized).
+        const float* h_chunk = input_volume.data.data() + (size_t)chunk_z0 * nxy;
+        GPUCHECK(cudaMemcpyAsync(m_d_vol_in, h_chunk,
+                                  (size_t)chunk_nz * slice_bytes,
+                                  cudaMemcpyHostToDevice, m_stream_filt));
 
-        dim3 blk(16, 16);
-        dim3 grd((nx + 15) / 16, (ny + 15) / 16);
-        hbRadonScatterKernel<<<grd, blk>>>(
-            d_slice, m_d_all_sinos,
-            nx, ny, z, na, bins, nz,
-            cx, cy, det_ctr);
+        // Обработка каждого слайса чанка.
+        for (int lz = 0; lz < chunk_nz; ++lz) {
+            const int z_global = chunk_z0 + lz;
+            float* d_slice = m_d_vol_in + (size_t)lz * nxy;
+
+            // 1. Async minmax → device memory
+            thrust::device_ptr<float> dp(d_slice);
+            auto mm = thrust::minmax_element(
+                thrust::cuda::par.on(m_stream_filt),
+                dp, dp + nxy);
+            // 2. DtoD copy в m_d_slice_minmax[2*z_global..2*z_global+1]
+            GPUCHECK(cudaMemcpyAsync(m_d_slice_minmax + 2 * z_global,
+                                      thrust::raw_pointer_cast(mm.first),
+                                      sizeof(float),
+                                      cudaMemcpyDeviceToDevice, m_stream_filt));
+            GPUCHECK(cudaMemcpyAsync(m_d_slice_minmax + 2 * z_global + 1,
+                                      thrust::raw_pointer_cast(mm.second),
+                                      sizeof(float),
+                                      cudaMemcpyDeviceToDevice, m_stream_filt));
+
+            // 3. Нормализация (читает vmin/vmax с device).
+            hbNormalizeFromDevicePairKernel<<<(nxy + 255) / 256, 256, 0, m_stream_filt>>>(
+                d_slice, nxy, m_d_slice_minmax + 2 * z_global);
+
+            // 4. Gather-Radon → пишет в m_d_all_sinos на ГЛОБАЛЬНЫЙ z_global.
+            hbRadonGatherKernel<<<grd_r, blk_r, 0, m_stream_filt>>>(
+                d_slice, m_d_all_sinos,
+                nx, ny, na, bins,
+                cx, cy, det_ctr,
+                /*z_slice=*/z_global, /*depth=*/nz);
+        }
     }
-    GPUCHECK(cudaDeviceSynchronize());
+
+    // (vmin,vmax)[nz] → (min[nz], span[nz]) для Этапа II.
+    hbMinMaxToMinSpanKernel<<<(nz + 255) / 256, 256, 0, m_stream_filt>>>(
+        m_d_slice_minmax, m_d_min_hu, m_d_span, nz);
+
+    GPUCHECK(cudaStreamSynchronize(m_stream_filt));
 
     auto t_sino_end = std::chrono::steady_clock::now();
     m_lastSinogramTimeMs = std::chrono::duration<double, std::milli>(t_sino_end - t_sino_start).count();
 
     // ====================================================================
-    // ЭТАП II — Pipelined chunk FBP с async CPU/GPU overlap.
+    // ЭТАП II — Pipelined chunk FBP с ping-pong overlap (filter ║ backproj).
     //
     //   На каждой итерации i:
-    //     [GPU stream_filt] : filter(i) → pad[i%2]
-    //     [GPU stream_copy] : D2H pad[i%2] → h_filt[i%2]
-    //     [CPU std::async]  : computeAirBoundariesFilteredCPU на h_filt[i%2]
-    //                         (запускается параллельно с GPU backproj(i-1))
-    //     [GPU stream_bp]   : backproj(i-1) с air-skip из h_umin/h_umax[(i-1)%2]
-    //                         → D2H output(i-1)
+    //     [GPU stream_filt] : filter(i+1) → pad[(i+1)%2]    (FFT/iFFT/scale)
+    //     [GPU stream_bp]   : backproj(i) ← pad[i%2] → 3D-tex → vol_out
+    //                                                       → D2H output
     //
-    //   Реальный CPU↔GPU overlap:
-    //     CPU bnd(i)   ║   GPU filter(i+1) + backproj(i-1)
+    //   Реальный GPU overlap: filter(i+1) ║ backproj(i) (разные streams).
+    //
+    // [SIMPLIFY] CPU air-boundary анализ отключён — для синтетических CT
+    // данных он почти всегда давал use_skip=false, при этом блокировал
+    // backproj на ~30мс/чанк CPU-работой и тратил PCIe на D2H фильтрованного
+    // pad'а. Для медицинских DICOM с большим воздухом можно вернуть
+    // (см. git history launch_async_boundaries).
     // ====================================================================
     const int n_chunks = (nz + CHUNK_Z - 1) / CHUNK_Z;
     const float pi_scale = (float)(M_PI / (2.0 * na));
@@ -770,10 +897,6 @@ void HybridBackend::reconstructVolume(const Volume& input_volume,
     double recon_accum_ms = 0.0;
     auto t_recon_start = std::chrono::steady_clock::now();
 
-    // [P2] Boundary-future возвращает air_fraction ∈ [0,1] для чанка.
-    //      Хост на основе этого выбирает template-вариант backproj kernel:
-    //      USE_AIR_SKIP=true (медицинская CT с air-фоном) или false (плотные данные).
-    std::future<float> bnd_future[2];
     int chunk_size[2]    = { 0, 0 };
     int chunk_z0_for[2]  = { 0, 0 };
 
@@ -822,19 +945,8 @@ void HybridBackend::reconstructVolume(const Volume& input_volume,
 
         cudaEventRecord(prof.filt_start, m_stream_filt);
 
-        // m_d_all_sinos уже содержит сырую синограмму. Скопируем нужные строки
-        // чанка в плотный layout [a*chunk_nz + lz][bins] прямо в начало pad[slot]
-        // во временную область... проще через separate copy в pad_layout buffer.
-        // Здесь упрощение: pack читает напрямую из m_d_all_sinos с layout
-        // [a*nz + z][bins], и нам нужно собрать чанк. Делаем 2D-memcpy на GPU:
-        // для каждого (a, lz) копируем строку src=(a*nz+z0+lz)*bins в pad_packed.
-        // Используем стандартный pack-kernel: на вход — расширенный layout.
-        // Альтернатива: явный gather-kernel. Для простоты ниже — отдельный
-        // gather-pack-kernel inline.
-
         // [P1] Объединённый gather+pack одним kernel'ом вместо na отдельных
-        //      cudaMemcpy2DAsync. Один launch вместо ~360 — экономия 2-3 сек
-        //      launch overhead'а на 8 чанков (на 512³ это ~15-25% общего времени).
+        //      cudaMemcpy2DAsync.
         GPUCHECK(cudaMemsetAsync(m_d_projs_pad[slot], 0,
                                  (size_t)chunk_rows * proj_pad * sizeof(float),
                                  m_stream_filt));
@@ -868,62 +980,32 @@ void HybridBackend::reconstructVolume(const Volume& input_volume,
         cudaEventRecord(prof.filt_end, m_stream_filt);
         cudaEventRecord(m_event_filt_done[slot], m_stream_filt);
 
-        // D2H filtered → h_filt[slot] на stream_copy (ждёт filter)
-        cudaStreamWaitEvent(m_stream_copy, m_event_filt_done[slot], 0);
-        GPUCHECK(cudaMemcpyAsync(m_h_filt[slot], m_d_projs_pad[slot],
-                                 (size_t)chunk_rows * proj_pad * sizeof(float),
-                                 cudaMemcpyDeviceToHost, m_stream_copy));
-        cudaEventRecord(prof.d2h_pad_end, m_stream_copy);
-        cudaEventRecord(m_event_d2h_done[slot], m_stream_copy);
+        // [SIMPLIFY] D2H фильтрованного pad'а к хосту больше не делаем — он был
+        // нужен только для CPU air-boundary анализа, который теперь отключён.
+        // Сохраняем event_d2h_done для совместимости с unused профайлингом.
+        cudaEventRecord(prof.d2h_pad_end, m_stream_filt);
+        cudaEventRecord(m_event_d2h_done[slot], m_stream_filt);
     };
-
-    auto launch_async_boundaries = [&](int chunk_idx, int slot) {
-        const int chunk_nz = chunk_size[slot];
-        const int z0       = chunk_z0_for[slot];
-        bnd_future[slot] = std::async(std::launch::async,
-            [this, slot, chunk_nz, z0, na, nz, proj_pad, sq]() -> float {
-                cudaEventSynchronize(m_event_d2h_done[slot]);
-                return computeAirBoundariesFilteredCPU(
-                    m_h_filt[slot], na, chunk_nz, (int)proj_pad, (int)sq,
-                    nz, z0,
-                    m_h_umin[slot], m_h_umax[slot]);
-            });
-    };
-
-    // [P2] Порог air_fraction: для меньших значений air-skip lookup'ы дороже
-    //      потенциального skip-выигрыша. 0.2 (=20% air) ~ граница для CT-фантомов.
-    constexpr float AIR_SKIP_THRESHOLD = 0.2f;
 
     auto launch_backproj = [&](int chunk_idx, int slot) {
         const int chunk_nz   = chunk_size[slot];
         const int z0         = chunk_z0_for[slot];
         ChunkProfile& prof   = profiles[chunk_idx];
 
-        // Должны быть готовы: (1) filter pad[slot] (2) boundaries h_umin/h_umax[slot]
-        prof.cpu_wait_start = std::chrono::steady_clock::now();
-        const float air_frac = bnd_future[slot].get();   // CPU thread join + air_fraction
-        prof.cpu_wait_end   = std::chrono::steady_clock::now();
-        const bool  use_air_skip = (air_frac >= AIR_SKIP_THRESHOLD);
-        prof.air_frac = air_frac;
-        prof.use_skip = use_air_skip;
+        // [SIMPLIFY] CPU air-boundary path отключён — для синтетических CT-данных
+        // air_frac обычно < AIR_SKIP_THRESHOLD, kernel всегда выбирал no-skip вариант,
+        // а CPU-работа блокировала backproj (~30мс на чанк ждали впустую). Если
+        // в будущем нужно для медицинских DICOM с большим воздухом — раскомментировать
+        // launch_async_boundaries и условную ветку ниже.
+        prof.cpu_wait_start = prof.cpu_wait_end = std::chrono::steady_clock::now();
+        prof.air_frac = 0.0f;
+        prof.use_skip = false;
 
         // stream_bp ждёт, что filter в pad[slot] завершился
         cudaStreamWaitEvent(m_stream_bp, m_event_filt_done[slot], 0);
         cudaEventRecord(prof.bp_start, m_stream_bp);
 
-        // [P2] H2D boundaries только если будем их использовать.
-        if (use_air_skip) {
-            const size_t bnd_full = (size_t)na * nz;
-            GPUCHECK(cudaMemcpyAsync(m_d_umin[slot], m_h_umin[slot],
-                                     bnd_full * sizeof(int), cudaMemcpyHostToDevice, m_stream_bp));
-            GPUCHECK(cudaMemcpyAsync(m_d_umax[slot], m_h_umax[slot],
-                                     bnd_full * sizeof(int), cudaMemcpyHostToDevice, m_stream_bp));
-        }
-
         // [P3] Заливаем pad[slot] в 3D-текстуру через cudaMemcpy3DAsync.
-        //   Source layout pad[(a * chunk_nz + lz) * proj_pad + u] эквивалентен 3D-форме
-        //   (sq fast, chunk_nz middle, na slow) с pitch = proj_pad * sizeof(float).
-        //   Mapping: a-слой texure'ы → a-блок в source (chunk_nz строк, sq колонок).
         ensureBackprojTexture3D((size_t)sq, (size_t)chunk_nz, (size_t)na);
         {
             cudaMemcpy3DParms p = {};
@@ -948,33 +1030,20 @@ void HybridBackend::reconstructVolume(const Volume& input_volume,
         dim3 grd((nx + blk.x - 1) / blk.x,
                  (ny + blk.y - 1) / blk.y,
                  (chunk_nz + blk.z - 1) / blk.z);
-        if (use_air_skip) {
-            hbVolumeBackprojTex3DKernel<true><<<grd, blk, 0, m_stream_bp>>>(
-                m_bpTexObj,
-                m_d_umin[slot], m_d_umax[slot],
-                nz, z0,
-                m_d_vol_out,
-                nx, ny, chunk_nz, (int)sq, na,
-                cx, cy, chunk_cz, det_cx, chunk_det_cy);
-        } else {
-            hbVolumeBackprojTex3DKernel<false><<<grd, blk, 0, m_stream_bp>>>(
-                m_bpTexObj,
-                nullptr, nullptr,
-                nz, z0,
-                m_d_vol_out,
-                nx, ny, chunk_nz, (int)sq, na,
-                cx, cy, chunk_cz, det_cx, chunk_det_cy);
-        }
+        hbVolumeBackprojTex3DKernel<false><<<grd, blk, 0, m_stream_bp>>>(
+            m_bpTexObj,
+            nullptr, nullptr,
+            nz, z0,
+            m_d_vol_out,
+            nx, ny, chunk_nz, (int)sq, na,
+            cx, cy, chunk_cz, det_cx, chunk_det_cy);
         cudaEventRecord(prof.bp_kernel_end, m_stream_bp);
 
-        // Denormalize per-slice
-        GPUCHECK(cudaMemcpyAsync(m_d_min_hu, h_min.data()  + z0, chunk_nz * sizeof(float),
-                                 cudaMemcpyHostToDevice, m_stream_bp));
-        GPUCHECK(cudaMemcpyAsync(m_d_span,   h_span.data() + z0, chunk_nz * sizeof(float),
-                                 cudaMemcpyHostToDevice, m_stream_bp));
+        // [SIMPLIFY] Denormalize: m_d_min_hu/m_d_span уже заполнены на device
+        // в Этапе I через hbMinMaxToMinSpanKernel — H2D больше не нужен.
         int n_chunk_vox = nx * ny * chunk_nz;
         hbDenormalizeVolumeKernel<<<(n_chunk_vox + 255) / 256, 256, 0, m_stream_bp>>>(
-            m_d_vol_out, m_d_min_hu, m_d_span, nx * ny, chunk_nz, pi_scale);
+            m_d_vol_out, m_d_min_hu + z0, m_d_span + z0, nx * ny, chunk_nz, pi_scale);
         cudaEventRecord(prof.denorm_end, m_stream_bp);
 
         // D2H output chunk на stream_bp
@@ -987,22 +1056,20 @@ void HybridBackend::reconstructVolume(const Volume& input_volume,
     };
 
     // -------------------- pipeline run --------------------
-    // Prologue: запустить filter+D2H+async boundary для чанка 0
+    // Prologue: запустить filter для чанка 0
     launch_filter(0, 0);
-    launch_async_boundaries(0, 0);
 
     for (int i = 0; i < n_chunks; ++i) {
         const int slot      = i % 2;
         const int slot_next = (i + 1) % 2;
 
-        // Запустить filter+D2H+async boundary для следующего чанка
+        // Запустить filter для следующего чанка
         // (бежит параллельно с backproj текущего).
         if (i + 1 < n_chunks) {
             launch_filter(i + 1, slot_next);
-            launch_async_boundaries(i + 1, slot_next);
         }
 
-        // Backproj текущего чанка (ждёт filter[slot] и boundaries[slot]).
+        // Backproj текущего чанка (ждёт filter[slot]).
         launch_backproj(i, slot);
 
         // Дождёмся D2H output текущего чанка перед onSliceDone.
