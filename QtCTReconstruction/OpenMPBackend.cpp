@@ -189,6 +189,63 @@ void OpenMPBackend::reconstructVolume(const Volume& input_volume,
     }
 }
 
+void OpenMPBackend::reconstructVolumeFromSinograms(
+    const Volume& sinograms,
+    const std::vector<float>& angles_deg,
+    Volume& out_reconstruction,
+    const ReconstructionParams& params,
+    std::function<void(int, const Buffer2D&)> onSliceDone)
+{
+    // sinograms layout: depth=nz, height=na, width=bins.
+    const size_t nz   = sinograms.depth;
+    const size_t na   = sinograms.height;
+    const size_t bins = sinograms.width;
+    if (nz == 0 || na == 0 || bins == 0) return;
+
+    const size_t output_size = bins;
+    out_reconstruction.assign(output_size, output_size, nz, 0.0f);
+    out_reconstruction.x_coords = sinograms.x_coords;   // обычно пусты для Consumer
+    out_reconstruction.y_coords = sinograms.y_coords;
+    out_reconstruction.z_coords = sinograms.z_coords;
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    // Параллельный per-slice loop. reconstructSlice использует thread-local
+    // FFT-плагины (см. FilteredBackprojection / IFFTBackend), так что safe.
+    // Если onSliceDone задан — вызовы из разных потоков в произвольном порядке;
+    // controller должен быть к этому готов (он thread-safe через QMetaObject).
+    #pragma omp parallel for schedule(dynamic)
+    for (int z = 0; z < static_cast<int>(nz); ++z) {
+        Sinogram s;
+        s.data = sinograms.getSlice(static_cast<size_t>(z));
+        s.angles_deg = angles_deg;
+        s.detector_spacing_mm = 1.0f;
+        // min/max HU per slice — оцениваем из самих данных синограммы.
+        float vmin = s.data.data.empty() ? 0.0f : s.data.data[0];
+        float vmax = vmin;
+        for (float v : s.data.data) {
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+        s.original_min_hu = vmin;
+        s.original_max_hu = vmax;
+
+        Buffer2D recon = reconstructSlice(s, output_size, params);
+        out_reconstruction.setSlice(static_cast<size_t>(z), recon);
+
+        if (onSliceDone) {
+            #pragma omp critical
+            onSliceDone(z, recon);
+        }
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    m_lastSinogramTimeMs = 0.0;  // forward Radon не делался
+    // m_lastReconstructionTimeMs у OpenMP нет (см. интерфейс — default 0),
+    // wall-time посчитается через controller.
+    (void)std::chrono::duration<double, std::milli>(t_end - t_start).count();
+}
+
 PointCloud OpenMPBackend::extractPointCloud(const Volume& vol, float threshold) {
     if (vol.empty()) return {};
 

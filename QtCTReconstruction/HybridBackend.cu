@@ -876,21 +876,40 @@ void HybridBackend::reconstructVolume(const Volume& input_volume,
     m_lastSinogramTimeMs = std::chrono::duration<double, std::milli>(t_sino_end - t_sino_start).count();
 
     // ====================================================================
-    // ЭТАП II — Pipelined chunk FBP с ping-pong overlap (filter ║ backproj).
-    //
-    //   На каждой итерации i:
-    //     [GPU stream_filt] : filter(i+1) → pad[(i+1)%2]    (FFT/iFFT/scale)
-    //     [GPU stream_bp]   : backproj(i) ← pad[i%2] → 3D-tex → vol_out
-    //                                                       → D2H output
-    //
-    //   Реальный GPU overlap: filter(i+1) ║ backproj(i) (разные streams).
-    //
-    // [SIMPLIFY] CPU air-boundary анализ отключён — для синтетических CT
-    // данных он почти всегда давал use_skip=false, при этом блокировал
-    // backproj на ~30мс/чанк CPU-работой и тратил PCIe на D2H фильтрованного
-    // pad'а. Для медицинских DICOM с большим воздухом можно вернуть
-    // (см. git history launch_async_boundaries).
+    // ЭТАП II — вынесен в runFbpStageII, чтобы его мог переиспользовать
+    // reconstructVolumeFromSinograms (где Этап I пропущен).
     // ====================================================================
+    runFbpStageII(out_reconstruction, params, nz, na, bins, onSliceDone);
+}
+
+// ============================================================
+//  Этап II — chunked FBP pipeline. Используется и reconstructVolume
+//  (после Этапа I — Радон), и reconstructVolumeFromSinograms (где
+//  m_d_all_sinos + m_d_min_hu/m_d_span уже заполнены вызывающим).
+// ============================================================
+void HybridBackend::runFbpStageII(Volume& out_reconstruction,
+                                   const ReconstructionParams& params,
+                                   int nz, int na, int bins,
+                                   std::function<void(int, const Buffer2D&)> onSliceDone) const
+{
+    const int nx = (int)out_reconstruction.width;
+    const int ny = (int)out_reconstruction.height;
+
+    const size_t sq           = static_cast<size_t>(std::ceil(std::sqrt(2.0) * (double)bins));
+    const size_t pad_before   = (sq / 2) - ((size_t)bins / 2);
+    const size_t proj_pad     = std::max<size_t>(64, utils::nextPowerOfTwo(2 * sq));
+    const size_t complex_size = proj_pad / 2 + 1;
+
+    constexpr int CHUNK_Z = 64;
+
+    const float cx      = (nx - 1) * 0.5f;
+    const float cy      = (ny - 1) * 0.5f;
+    const float det_cx  = (float)(sq / 2);
+
+    // Filter capability — вызывающий уже сделал ensureFilter(proj_pad, params.filter)
+    // через предыдущие ensure*, но повторный вызов идемпотентен (см. cache в impl).
+    ensureFilter(proj_pad, params.filter);
+
     const int n_chunks = (nz + CHUNK_Z - 1) / CHUNK_Z;
     const float pi_scale = (float)(M_PI / (2.0 * na));
 
@@ -1159,6 +1178,93 @@ void HybridBackend::reconstructVolume(const Volume& input_volume,
         cudaEventDestroy(p.denorm_end);
         cudaEventDestroy(p.d2h_out_end);
     }
+}
+
+// ============================================================
+//  reconstructVolumeFromSinograms — Consumer-path
+// ============================================================
+// Этап I (forward Radon) пропускается. Синограммы загружаются с хоста сразу
+// в m_d_all_sinos. m_d_min_hu/m_d_span заполняются нулями/единицами (вход уже
+// нормализован Producer'ом; для UI это не важно, так как sliceToImage опять
+// нормализует на лету). После — стандартный Этап II.
+void HybridBackend::reconstructVolumeFromSinograms(
+    const Volume& sinograms,
+    const std::vector<float>& angles_deg,
+    Volume& out_reconstruction,
+    const ReconstructionParams& params,
+    std::function<void(int, const Buffer2D&)> onSliceDone)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (sinograms.empty()) return;
+
+    const int nz   = (int)sinograms.depth;
+    const int na   = (int)sinograms.height;
+    const int bins = (int)sinograms.width;
+    // Реконструкция в куб bins × bins × nz (как обычная reconstructVolume).
+    const int nx = bins, ny = bins;
+
+    out_reconstruction.assign(nx, ny, nz, 0.0f);
+
+    // Подготовка углов: используем переданные (если они есть и нужного размера),
+    // иначе равномерные [0, 180).
+    std::vector<float> angles = angles_deg;
+    if ((int)angles.size() != na) {
+        angles.assign(na, 0.0f);
+        const float step = 180.0f / (float)na;
+        for (int a = 0; a < na; ++a) angles[a] = step * (float)a;
+    }
+
+    constexpr int CHUNK_Z = 64;
+    ensureWorkspace((size_t)nx, (size_t)ny, (size_t)nz,
+                    (size_t)na, (size_t)bins, (size_t)CHUNK_Z);
+    ensureFilter(std::max<size_t>(64,
+                  utils::nextPowerOfTwo(2 * (size_t)std::ceil(std::sqrt(2.0) * bins))),
+                  params.filter);
+    ensureTrigTables(angles);
+    ensureStreams();
+
+    auto t_sino_start = std::chrono::steady_clock::now();
+
+    // ---------- ЗАГРУЗКА СИНОГРАММ → m_d_all_sinos ----------
+    // Входной layout (Volume.data): row-major (z, a, b). Размер = nz*na*bins.
+    // Целевой layout (m_d_all_sinos): row-major (a, z, b) — этого ждёт
+    // hbGatherPackKernel (см. Этап II).
+    // Перестановка делается на хосте в temp-буфере, потом одна H2D копия.
+    // Для 1024×180×1024 float32 = 754 МБ — ОК на современном железе.
+    const size_t total_floats = (size_t)nz * na * bins;
+    std::vector<float> tmp(total_floats);
+    #pragma omp parallel for schedule(static)
+    for (int z = 0; z < nz; ++z) {
+        for (int a = 0; a < na; ++a) {
+            const float* src = &sinograms.data[((size_t)z * na + a) * bins];
+            float* dst       = &tmp[((size_t)a * nz + z) * bins];
+            std::memcpy(dst, src, bins * sizeof(float));
+        }
+    }
+    GPUCHECK(cudaMemcpy(m_d_all_sinos, tmp.data(),
+                         total_floats * sizeof(float),
+                         cudaMemcpyHostToDevice));
+
+    // ---------- min/span заглушки ----------
+    // Producer нормализовал входной том per-slice в [0,1] перед Радоном; здесь
+    // мы это компенсировать не можем без per-slice мета. Ставим min=0, span=1 →
+    // денормализация сводится к умножению на pi_scale. UI всё равно нормализует
+    // картинку для отображения, так что визуально это правильно.
+    std::vector<float> hzeros(nz, 0.0f);
+    std::vector<float> hones (nz, 1.0f);
+    GPUCHECK(cudaMemcpy(m_d_min_hu, hzeros.data(), nz * sizeof(float), cudaMemcpyHostToDevice));
+    GPUCHECK(cudaMemcpy(m_d_span,   hones.data(),  nz * sizeof(float), cudaMemcpyHostToDevice));
+
+    auto t_sino_end = std::chrono::steady_clock::now();
+    // Этап I в этом пути отсутствует — но регистрируем время загрузки.
+    m_lastSinogramTimeMs = std::chrono::duration<double, std::milli>(t_sino_end - t_sino_start).count();
+    std::fprintf(stderr,
+        "[Hybrid] reconstructVolumeFromSinograms: H2D nz=%d na=%d bins=%d in %.2f ms\n",
+        nz, na, bins, m_lastSinogramTimeMs);
+    std::fflush(stderr);
+
+    // ---------- ЭТАП II (общий с reconstructVolume) ----------
+    runFbpStageII(out_reconstruction, params, nz, na, bins, onSliceDone);
 }
 
 // ============================================================

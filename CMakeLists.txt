@@ -20,9 +20,16 @@ find_package(OpenMP REQUIRED)
 # CUDA setup
 find_package(CUDAToolkit REQUIRED)
 
-# Source files
-set(SOURCES
-    QtCTReconstruction/main.cpp
+# ============================================================
+# Producer / Consumer split
+# ------------------------------------------------------------
+# Из одного source tree собираем ДВА exe:
+#   * QtCTReconstruction          — Producer (Generate → Reconstruct → Export Sino)
+#   * QtCTReconstructionConsumer  — Consumer (Load Sinograms → Reconstruct → Export PNG)
+# Различия только в main.{cpp,qml} и compile-time дефайнах CT_PRODUCER_BUILD /
+# CT_CONSUMER_BUILD. Всё остальное (backend'ы, controller, FileIO, ...) общее.
+# ============================================================
+set(CT_COMMON_SOURCES
     QtCTReconstruction/AppWindow.cpp
     QtCTReconstruction/CtReconstructionController.cpp
     QtCTReconstruction/CtSliceImageProvider.cpp
@@ -63,13 +70,13 @@ if(FFT_BACKEND STREQUAL "FFTW")
     if(NOT FFTW3F_FOUND)
         # Ручной поиск через find_library
         find_library(FFTW3F_LIB NAMES fftw3f fftw3f-3 libfftw3f-3
-            HINTS 
+            HINTS
                 "$ENV{FFTW_DIR}/lib"
                 "C:/fftw"
                 "C:/Program Files/fftw"
         )
         find_path(FFTW3F_INCLUDE_DIR NAMES fftw3.h
-            HINTS 
+            HINTS
                 "$ENV{FFTW_DIR}/include"
                 "C:/fftw"
                 "C:/Program Files/fftw"
@@ -107,66 +114,77 @@ if(NOT DEFINED BUILD_SERIAL_BACKEND)
     endif()
 endif()
 
-qt_add_executable(${PROJECT_NAME} MANUAL_FINALIZATION ${SOURCES})
-
-# --- Зависимости, связываемые с FFT-бэкендом ---
-if(FFT_BACKEND STREQUAL "FFTW" AND FFTW3F_FOUND)
-    target_sources(${PROJECT_NAME} PRIVATE
-        QtCTReconstruction/FFTBackendFFTW.cpp
-    )
-    target_compile_definitions(${PROJECT_NAME} PRIVATE CT_FFT_BACKEND_FFTW)
-    target_include_directories(${PROJECT_NAME} PRIVATE ${FFTW3F_INCLUDE_DIRS})
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${FFTW3F_LIBRARIES})
-endif()
-
-# --- Serial backend ---
-if(BUILD_SERIAL_BACKEND)
-    target_sources(${PROJECT_NAME} PRIVATE QtCTReconstruction/SerialBackend.cpp)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE CT_HAS_SERIAL_BACKEND)
-    message(STATUS "[CT] SerialBackend: ENABLED")
+# ============================================================
+# Иконка приложения
+# ------------------------------------------------------------
+# Сгенерируйте один раз: python resources/generate_icon.py
+# (требует pip install cairosvg pillow). После генерации re-configure
+# НЕ нужен — POST_BUILD copy для PNG и сам .rc embed для .ico
+# подхватятся автоматически: copy_if_different + проверка через CMake-скрипт.
+# ============================================================
+set(CT_APP_ICON_RC  "${CMAKE_CURRENT_SOURCE_DIR}/resources/app_icon.rc")
+set(CT_APP_ICON_ICO "${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.ico")
+set(CT_APP_ICON_PNG "${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.png")
+# .rc-файл всегда добавляем в исходники — RC-компилятор сам проверит ICO
+# и завершится с ошибкой если файла нет. Чтобы избежать ошибки сборки в
+# отсутствии иконки, .rc-файл условно подключается через EXISTS только для
+# Windows. Если ICO нет на момент configure — печатаем предупреждение.
+if(WIN32 AND EXISTS "${CT_APP_ICON_ICO}")
+    set(_ct_icon_sources "${CT_APP_ICON_RC}")
+    message(STATUS "[CT] App icon (.ico embedded into .exe): ${CT_APP_ICON_ICO}")
 else()
-    message(STATUS "[CT] SerialBackend: DISABLED (Release build)")
+    set(_ct_icon_sources "")
+    if(WIN32)
+        message(STATUS "[CT] App icon NOT found at ${CT_APP_ICON_ICO}")
+        message(STATUS "     Run: python resources/generate_icon.py")
+        message(STATUS "     Затем перезапустите cmake configure для embed в .exe")
+    endif()
 endif()
 
-# Include directories
-target_include_directories(${PROJECT_NAME} PRIVATE QtCTReconstruction)
-
-# Dependencies
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Widgets
-    Qt6::Quick
-    Qt6::QuickControls2
-    Qt6::QuickLayouts
-    Qt6::3DCore
-    Qt6::3DRender
-    Qt6::3DExtras
-    Qt6::3DQuick
-    Qt6::3DQuickScene3D
-    OpenMP::OpenMP_CXX
-    CUDA::cudart
-    CUDA::cufft
-    gdiplus
-    comctl32
+# ============================================================
+# Два exe: Producer (основной) + Consumer (для FBP по готовым синограммам)
+# ============================================================
+qt_add_executable(QtCTReconstruction MANUAL_FINALIZATION
+    ${CT_COMMON_SOURCES}
+    QtCTReconstruction/main.cpp
+    ${_ct_icon_sources}
 )
+target_compile_definitions(QtCTReconstruction PRIVATE CT_PRODUCER_BUILD)
 
-# === FIX FOR MSVC: LLVM OpenMP + C++ Exception Semantics ===
-# OpenMP also enabled for CUDA host code so #pragma omp works inside .cu files.
-# HybridBackend.cu использует OpenMP для CPU-стадии (computeAirBoundariesFilteredCPU);
-# CUDABackend сам по себе pure-GPU, но компиляция CUDA-host-кода под /openmp:llvm
-# нужна для совместимости (исключения, runtime).
-if(MSVC)
-    target_compile_options(${PROJECT_NAME} PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>
-        $<$<COMPILE_LANGUAGE:CXX>:/openmp:experimental>
-        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/openmp:llvm>
+qt_add_executable(QtCTReconstructionConsumer MANUAL_FINALIZATION
+    ${CT_COMMON_SOURCES}
+    QtCTReconstruction/main_consumer.cpp
+    ${_ct_icon_sources}
+)
+target_compile_definitions(QtCTReconstructionConsumer PRIVATE CT_CONSUMER_BUILD)
+
+# ============================================================
+# Иконка в Qt-resource (для setWindowIcon в рантайме).
+# QIcon(":/icons/icon.png") работает гарантированно если PNG был на месте
+# в момент cmake configure. QT_RESOURCE_ALIAS устанавливает фиксированное
+# имя в ресурс-системе (иначе абсолютный путь из FILES может попасть в URI).
+# ============================================================
+if(EXISTS "${CT_APP_ICON_PNG}")
+    set_source_files_properties("${CT_APP_ICON_PNG}" PROPERTIES
+        QT_RESOURCE_ALIAS "icon.png"
     )
+    foreach(_tgt IN ITEMS QtCTReconstruction QtCTReconstructionConsumer)
+        qt_add_resources(${_tgt} "${_tgt}_app_icon"
+            PREFIX "/icons"
+            FILES "${CT_APP_ICON_PNG}"
+        )
+    endforeach()
+    message(STATUS "[CT] App icon (.png embedded into Qt resource): ${CT_APP_ICON_PNG}")
+    message(STATUS "     Resource path: :/icons/icon.png")
+else()
+    message(STATUS "[CT] App icon PNG not found — runtime icon will be Qt default.")
+    message(STATUS "     Run: python resources/generate_icon.py + re-configure cmake")
 endif()
 
-# QML files (Qt 6 resource system)
-qt_add_qml_module(${PROJECT_NAME}
+# QML модули — у каждого свой URI, чтобы ресурсы не конфликтовали.
+# Producer'у нужны 3D-viewer (PointCloudWindow) и осевая обёртка (ImageWithAxes).
+# Consumer'у достаточно ImageWithAxes — точечного облака у него нет.
+qt_add_qml_module(QtCTReconstruction
     URI QtCTReconstruction
     VERSION 1.0
     QML_FILES
@@ -175,42 +193,15 @@ qt_add_qml_module(${PROJECT_NAME}
         QtCTReconstruction/ImageWithAxes.qml
 )
 
-# Configurations for Debug/Release specifics if needed in C++
-target_compile_definitions(${PROJECT_NAME} PRIVATE 
-    $<$<CONFIG:Debug>:CT_DEBUG_MODE>
-    $<$<CONFIG:Release>:CT_RELEASE_MODE>
+qt_add_qml_module(QtCTReconstructionConsumer
+    URI QtCTReconstructionConsumer
+    VERSION 1.0
+    QML_FILES
+        QtCTReconstruction/main_consumer.qml
+        QtCTReconstruction/ImageWithAxes.qml
 )
 
-qt_import_qml_plugins(${PROJECT_NAME})
-qt_finalize_executable(${PROJECT_NAME})
-
-if(MSVC)
-    add_compile_options(/utf-8 /Zc:preprocessor)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler /Zc:preprocessor")
-endif()
-
-# ============================================================
-# CUDA optimisation flags (5.1)
-# ------------------------------------------------------------
-# Release / RelWithDebInfo:
-#   -O3                       — макс. оптимизация PTX
-#   --use_fast_math           — sincos→__sincosf, fdiv→__fdividef, FTZ denormals
-#                               (для Radon/backproj точность float32 достаточна;
-#                                ramp-filter и lerp не страдают)
-#   -lineinfo                 — source-маркировка для Nsight Compute / nvprof
-#                               (НЕ отключает оптимизации, безопасно в Release)
-#   --ptxas-options=-v        — печать регистров/spills в build log
-#   -Xcompiler /O2 (MSVC)     — host-сторону NVCC тоже оптимизировать
-#
-# Debug:
-#   По умолчанию NVCC ставит -G -g → kernel'ы в 5-15× медленнее.
-#   Опция CT_CUDA_FAST_DEBUG=ON убирает -G (host-debug сохраняется), полезна
-#   для бенчмаркинга в IDE без переключения конфигурации.
-# ============================================================
-option(CT_CUDA_FAST_DEBUG
-       "Strip -G from Debug CUDA flags (kernels run at full speed; host -g kept)"
-       OFF)
-
+# CUDA optimisation flags (выносим до foreach, т.к. используются внутри него)
 set(_ct_cuda_release_flags
     -O3
     --use_fast_math
@@ -221,15 +212,114 @@ if(MSVC)
     list(APPEND _ct_cuda_release_flags -Xcompiler=/O2)
 endif()
 
-target_compile_options(${PROJECT_NAME} PRIVATE
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:${_ct_cuda_release_flags}>
-    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:${_ct_cuda_release_flags}>
-)
+# ============================================================
+# Общая конфигурация ДЛЯ ОБОИХ таргетов
+# ============================================================
+foreach(_tgt IN ITEMS QtCTReconstruction QtCTReconstructionConsumer)
+
+    # --- FFT backend ---
+    if(FFT_BACKEND STREQUAL "FFTW" AND FFTW3F_FOUND)
+        target_sources(${_tgt} PRIVATE
+            QtCTReconstruction/FFTBackendFFTW.cpp
+        )
+        target_compile_definitions(${_tgt} PRIVATE CT_FFT_BACKEND_FFTW)
+        target_include_directories(${_tgt} PRIVATE ${FFTW3F_INCLUDE_DIRS})
+        target_link_libraries(${_tgt} PRIVATE ${FFTW3F_LIBRARIES})
+    endif()
+
+    # --- Serial backend ---
+    if(BUILD_SERIAL_BACKEND)
+        target_sources(${_tgt} PRIVATE QtCTReconstruction/SerialBackend.cpp)
+        target_compile_definitions(${_tgt} PRIVATE CT_HAS_SERIAL_BACKEND)
+    endif()
+
+    target_include_directories(${_tgt} PRIVATE QtCTReconstruction)
+
+    target_link_libraries(${_tgt} PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Quick
+        Qt6::QuickControls2
+        Qt6::QuickLayouts
+        Qt6::3DCore
+        Qt6::3DRender
+        Qt6::3DExtras
+        Qt6::3DQuick
+        Qt6::3DQuickScene3D
+        OpenMP::OpenMP_CXX
+        CUDA::cudart
+        CUDA::cufft
+        gdiplus
+        comctl32
+    )
+
+    # --- MSVC: OpenMP + EH ---
+    if(MSVC)
+        target_compile_options(${_tgt} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>
+            $<$<COMPILE_LANGUAGE:CXX>:/openmp:experimental>
+            $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/openmp:llvm>
+        )
+    endif()
+
+    # --- Debug/Release дефайны ---
+    target_compile_definitions(${_tgt} PRIVATE
+        $<$<CONFIG:Debug>:CT_DEBUG_MODE>
+        $<$<CONFIG:Release>:CT_RELEASE_MODE>
+    )
+
+    # --- CUDA Release flags ---
+    target_compile_options(${_tgt} PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:${_ct_cuda_release_flags}>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:${_ct_cuda_release_flags}>
+    )
+
+    # --- Release с PDB-символами ---
+    if(MSVC)
+        target_compile_options(${_tgt} PRIVATE
+            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/Zi>
+            $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-Xcompiler=/Zi>
+            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:RelWithDebInfo>>:/Zi>
+            $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:-Xcompiler=/Zi>
+        )
+        target_link_options(${_tgt} PRIVATE
+            $<$<CONFIG:Release>:/DEBUG>
+            $<$<CONFIG:Release>:/OPT:REF>
+            $<$<CONFIG:Release>:/OPT:ICF>
+            $<$<CONFIG:RelWithDebInfo>:/DEBUG>
+            $<$<CONFIG:RelWithDebInfo>:/OPT:REF>
+            $<$<CONFIG:RelWithDebInfo>:/OPT:ICF>
+        )
+    endif()
+
+    qt_import_qml_plugins(${_tgt})
+    qt_finalize_executable(${_tgt})
+
+endforeach()
+
+# --- Логи о Serial backend (один раз, не в foreach) ---
+if(BUILD_SERIAL_BACKEND)
+    message(STATUS "[CT] SerialBackend: ENABLED (both targets)")
+else()
+    message(STATUS "[CT] SerialBackend: DISABLED (Release build)")
+endif()
+
+# --- Глобальные MSVC флаги (не per-target) ---
+if(MSVC)
+    add_compile_options(/utf-8 /Zc:preprocessor)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler /Zc:preprocessor")
+endif()
+
+# ============================================================
+# CUDA Debug режим (фастер дебаг без -G)
+# ============================================================
+option(CT_CUDA_FAST_DEBUG
+       "Strip -G from Debug CUDA flags (kernels run at full speed; host -g kept)"
+       OFF)
 
 if(CT_CUDA_FAST_DEBUG)
-    # NVCC ставит -G -g для Debug по дефолту через CMAKE_CUDA_FLAGS_DEBUG.
-    # Перезаписываем: только -g (host debug info), без device-debug → kernels
-    # компилируются с оптимизацией.
     set(CMAKE_CUDA_FLAGS_DEBUG "-g" CACHE STRING "" FORCE)
     message(STATUS "[CT] CUDA Debug: FAST mode (no -G, kernels optimised)")
 else()
@@ -237,44 +327,45 @@ else()
 endif()
 
 # ============================================================
-# Release с PDB-символами (для отладки heap-corruption / crash dumps).
-# /Zi   — C++ компилятор пишет debug info в .pdb
-# /DEBUG — линкер генерирует .pdb рядом с .exe
-# /OPT:REF /OPT:ICF — сохраняем Release-оптимизации (по умолчанию /DEBUG их
-#                     отключает; явное /OPT:REF /OPT:ICF возвращает).
-# Для CUDA host-стороны: -Xcompiler=/Zi.
+# windeployqt: разворачиваем Qt-плагины и QML для ОБОИХ exe
 # ============================================================
-if(MSVC)
-    target_compile_options(${PROJECT_NAME} PRIVATE
-        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/Zi>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-Xcompiler=/Zi>
-        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:RelWithDebInfo>>:/Zi>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:-Xcompiler=/Zi>
-    )
-    target_link_options(${PROJECT_NAME} PRIVATE
-        $<$<CONFIG:Release>:/DEBUG>
-        $<$<CONFIG:Release>:/OPT:REF>
-        $<$<CONFIG:Release>:/OPT:ICF>
-        $<$<CONFIG:RelWithDebInfo>:/DEBUG>
-        $<$<CONFIG:RelWithDebInfo>:/OPT:REF>
-        $<$<CONFIG:RelWithDebInfo>:/OPT:ICF>
-    )
-endif()
-
 if(WIN32)
-    find_program(WINDEPLOYQT windeployqt 
-        HINTS "${Qt6Core_DIR}/../../../bin" 
+    find_program(WINDEPLOYQT windeployqt
+        HINTS "${Qt6Core_DIR}/../../../bin"
         REQUIRED
     )
-    
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${WINDEPLOYQT} 
-            --debug 
-            --qmldir "${CMAKE_CURRENT_SOURCE_DIR}/QtCTReconstruction"
-            --no-translations 
-            --no-system-d3d-compiler
-            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/$<TARGET_FILE_NAME:${PROJECT_NAME}>"
-        COMMENT "📦 Deploying Qt dependencies with windeployqt..."
-        VERBATIM
-    )
+
+    foreach(_tgt IN ITEMS QtCTReconstruction QtCTReconstructionConsumer)
+        add_custom_command(TARGET ${_tgt} POST_BUILD
+            COMMAND ${WINDEPLOYQT}
+                --debug
+                --qmldir "${CMAKE_CURRENT_SOURCE_DIR}/QtCTReconstruction"
+                --no-translations
+                --no-system-d3d-compiler
+                "$<TARGET_FILE_DIR:${_tgt}>/$<TARGET_FILE_NAME:${_tgt}>"
+            COMMENT "📦 Deploying Qt dependencies for ${_tgt}..."
+            VERBATIM
+        )
+
+        # Копируем icon.png рядом с .exe (для setWindowIcon в рантайме).
+        # Используем CMake-скрипт, чтобы проверка "файл существует" делалась
+        # на этапе сборки (а не configure'а) — если пользователь сгенерил PNG
+        # ПОСЛЕ cmake configure, иконка всё равно скопируется без re-configure.
+        add_custom_command(TARGET ${_tgt} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DSRC=${CT_APP_ICON_PNG}"
+                "-DDST=$<TARGET_FILE_DIR:${_tgt}>/icon.png"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake"
+            COMMENT "🖼  Copying icon.png next to ${_tgt}.exe (if generated)"
+            VERBATIM
+        )
+    endforeach()
+
+    # Оба exe лежат в одной директории out/build/release/. Их POST_BUILD
+    # windeployqt параллельно пишут одни и те же Qt-плагины/QML-файлы → race
+    # condition ("Cannot copy ... Destination file exists"). Принудительно
+    # сериализуем: Consumer ждёт, пока Producer не закончит линковку + деплой.
+    # На повторной сборке windeployqt видит "up to date" → перезаписей нет,
+    # без зависимости тоже работает; но первая чистая сборка падает.
+    add_dependencies(QtCTReconstructionConsumer QtCTReconstruction)
 endif()

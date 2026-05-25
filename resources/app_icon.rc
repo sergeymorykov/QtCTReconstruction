@@ -1,0 +1,4 @@
+// Windows-resource: embeddedая иконка в .exe.
+// Виден в Explorer / taskbar до запуска приложения.
+// Иконка ID 1 — Windows подхватывает её автоматически как app icon.
+1 ICON "icon.ico"

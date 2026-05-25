@@ -28,6 +28,9 @@ class CtReconstructionController : public QObject {
     Q_PROPERTY(bool asBuffer READ asBuffer WRITE setAsBuffer NOTIFY asBufferChanged)
     Q_PROPERTY(int volumeSize READ volumeSize WRITE setVolumeSize NOTIFY volumeSizeChanged)
     Q_PROPERTY(bool isDebugBuild READ isDebugBuild CONSTANT)
+#ifdef CT_CONSUMER_BUILD
+    Q_PROPERTY(bool hasSinograms READ hasSinograms NOTIFY hasSinogramsChanged)
+#endif
 
 public:
     explicit CtReconstructionController(QObject* parent = nullptr);
@@ -55,6 +58,20 @@ public:
     // Экспортирует ВСЕ срезы реконструкции как slice_0000.png … slice_NNNN.png
     // в выбранную пользователем директорию.
     Q_INVOKABLE void exportAllReconstructionPng();
+#ifdef CT_PRODUCER_BUILD
+    // Выгружает все синограммы в виде NPY-тома shape (nz, na, bins) +
+    // sidecar JSON с углами и метаданными. Файл совместим с loadSinograms
+    // в Consumer-сборке.
+    Q_INVOKABLE void exportAllSinograms();
+#endif
+
+#ifdef CT_CONSUMER_BUILD
+    // Загружает NPY-том синограмм shape (nz, na, bins) и (опционально)
+    // sidecar JSON с метаданными. Если JSON нет — углы выводятся из na как
+    // равномерные [0, 180), spacing=1, min/max HU считаются из самих данных.
+    Q_INVOKABLE bool loadSinograms();
+    bool hasSinograms() const;
+#endif
     // Открывает file dialog, парсит .npy/.ply/.csv → m_loadedCloud.
     // Возвращает true, если облако успешно загружено.
     Q_INVOKABLE bool loadPointCloud();
@@ -88,6 +105,9 @@ signals:
     void volumeSizeChanged();
     void maxDifferenceChanged();
     void sliceUpdated(int index);
+#ifdef CT_CONSUMER_BUILD
+    void hasSinogramsChanged();
+#endif
 
 private:
     enum class ImageKind { Original, Sinogram, Reconstruction, Difference };
@@ -157,6 +177,16 @@ private:
     // Облако точек, загруженное с диска через loadPointCloud(). Используется
     // PointCloudWindow при useLoadedCloud=true вместо извлечения из текущего тома.
     ct::PointCloud m_loadedCloud;
+
+#ifdef CT_CONSUMER_BUILD
+    // Загруженные синограммы (Consumer-build): том shape (nz, na, bins).
+    // Используется в reconstructionTask вместо синтетического тома + Радона.
+    ct::Volume m_loadedSinograms;
+    std::vector<float> m_loadedAngles;     // длина = na
+    float m_loadedSpacingMm = 1.0f;
+    float m_loadedMinHu = 0.0f;            // из meta или дефолт
+    float m_loadedMaxHu = 0.0f;
+#endif
 
     QPointer<QFutureWatcher<ReconstructionResult>> m_activeWatcher;
 

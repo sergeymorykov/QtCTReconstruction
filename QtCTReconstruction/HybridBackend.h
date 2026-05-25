@@ -49,6 +49,16 @@ public:
                            const ReconstructionParams& params,
                            std::function<void(int, const Buffer2D&)> onSliceDone) override;
 
+    // Consumer-путь: Этап I (Радон) пропускается. m_d_all_sinos заполняется
+    // напрямую из загруженных sino-данных, дальше работает существующий Этап II
+    // (filter → chunked backproj через 3D-текстуру).
+    void reconstructVolumeFromSinograms(
+        const Volume& sinograms,
+        const std::vector<float>& angles_deg,
+        Volume& out_reconstruction,
+        const ReconstructionParams& params,
+        std::function<void(int, const Buffer2D&)> onSliceDone) override;
+
     PointCloud extractPointCloud(const Volume& vol, float threshold) override;
     double lastSinogramTimeMs()      const override { return m_lastSinogramTimeMs; }
     double lastReconstructionTimeMs() const override { return m_lastReconstructionTimeMs; }
@@ -142,6 +152,15 @@ private:
     void ensureBackprojTexture3D(size_t sq, size_t chunk_nz, size_t na) const;
     void ensureStreams() const;
     void releaseAll() const;
+
+    // Этап II: chunked FBP pipeline (filter ║ backproj через ping-pong streams).
+    // Предусловия: m_d_all_sinos (na × nz × bins) и m_d_min_hu/m_d_span (nz)
+    // уже заполнены вызывающим. Используется и reconstructVolume (после Этапа I),
+    // и reconstructVolumeFromSinograms (после H2D загруженных синограмм).
+    void runFbpStageII(Volume& out_reconstruction,
+                       const ReconstructionParams& params,
+                       int nz, int na, int bins,
+                       std::function<void(int, const Buffer2D&)> onSliceDone) const;
 };
 
 } // namespace ct

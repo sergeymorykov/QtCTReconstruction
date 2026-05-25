@@ -17,6 +17,12 @@ Item {
     property string colorScaleMaxText: "50"
     property color accentColor: "#64b5f6"
 
+    // Фактический размер загруженного изображения в пикселях (из image provider).
+    // 0 пока картинка не загрузилась. Полезно для биндинга осей к реальным
+    // размерам реконструкции, а не к "ожидаемому" volumeSize.
+    readonly property int sourcePixelWidth:  mainImage.sourceSize.width
+    readonly property int sourcePixelHeight: mainImage.sourceSize.height
+
     signal clicked()
 
     implicitWidth: 400

@@ -13,6 +13,9 @@
 #include <QFuture>
 #include <QGuiApplication>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMutexLocker>
 #include <QRegularExpression>
 #include <QStringList>
@@ -882,11 +885,22 @@ void CtReconstructionController::startReconstruction() {
     qDebug() << "[CT] startReconstruction: clicked";
     {
         QMutexLocker lock(&m_mutex);
+#ifdef CT_CONSUMER_BUILD
+        // Consumer гейтит готовностью загруженных синограмм, не hasVolume.
+        const bool ready_to_start = !m_loadedSinograms.empty();
+        qDebug() << "[CT] startReconstruction: state running=" << m_running
+                 << "hasSinograms=" << ready_to_start << "ready=" << m_ready;
+        if (m_running || !ready_to_start) {
+            qDebug() << "[CT] startReconstruction: ignored (need to load sinograms)";
+            return;
+        }
+#else
         qDebug() << "[CT] startReconstruction: state running=" << m_running << "hasVolume=" << m_hasVolume << "ready=" << m_ready;
         if (m_running || !m_hasVolume) {
             qDebug() << "[CT] startReconstruction: ignored";
             return;
         }
+#endif
         m_running = true;
         m_ready = false;
         m_maxZ = 0;
@@ -916,6 +930,105 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     ReconstructionResult results;
     results.success = false;
 
+#ifdef CT_CONSUMER_BUILD
+    // ============================================================
+    // Consumer-вариант: FBP по уже загруженным синограммам.
+    // Этап I (forward Radon) полностью пропускается.
+    // UI заполняется только Reconstruction (Original/Sinogram/Difference
+    // не имеют смысла — исходного тома нет, а синограммы сами на входе).
+    // ============================================================
+    int backendId, filterId;
+    ct::Volume loadedSino;
+    std::vector<float> angles;
+    {
+        QMutexLocker lock(&m_mutex);
+        backendId  = m_backendType;
+        filterId   = m_filterType;
+        loadedSino = m_loadedSinograms;     // копия
+        angles     = m_loadedAngles;
+        results.genTimeSec = m_genTimeSec;
+    }
+
+    if (loadedSino.empty()) {
+        qDebug() << "[CT] computeAll: no sinograms loaded";
+        return results;
+    }
+
+    const int nz   = static_cast<int>(loadedSino.depth);
+    const int na   = static_cast<int>(loadedSino.height);
+    const int bins = static_cast<int>(loadedSino.width);
+
+    results.hasVolume = true;   // используется UI как «есть с чем работать»
+    results.maxZ      = nz - 1;
+    results.currentZ  = nz / 2;
+    results.reconstructionImages = std::make_shared<std::vector<QImage>>(static_cast<size_t>(nz));
+    // Остальные слоты Consumer не заполняет (UI у него их и не отображает).
+    results.originalImages       = std::make_shared<std::vector<QImage>>();
+    results.sinogramImages       = std::make_shared<std::vector<QImage>>();
+    results.differenceImages     = std::make_shared<std::vector<QImage>>();
+
+    ct::ReconstructionParams params = defaultReconstructionParams();
+    if      (filterId == 0) params.filter = ct::ReconstructionParams::FilterType::Ramp;
+    else if (filterId == 1) params.filter = ct::ReconstructionParams::FilterType::SheppLogan;
+    else if (filterId == 2) params.filter = ct::ReconstructionParams::FilterType::Hamming;
+    else if (filterId == 3) params.filter = ct::ReconstructionParams::FilterType::Cosine;
+    else if (filterId == 4) params.filter = ct::ReconstructionParams::FilterType::Hann;
+    else if (filterId == 5) params.filter = ct::ReconstructionParams::FilterType::Bartlett;
+    params.num_angles = static_cast<size_t>(na);  // из загруженных данных
+
+    auto backendImpl = ct::BackendFactory::create(
+        static_cast<ct::BackendFactory::BackendType>(backendId));
+    if (!backendImpl || !backendImpl->isAvailable()) {
+        backendImpl = ct::BackendFactory::createBestAvailable();
+    }
+    qDebug() << "[CT] computeAll[Consumer]: backend="
+             << QString::fromStdString(backendImpl->name())
+             << "nz=" << nz << "na=" << na << "bins=" << bins;
+
+    // ВАЖНО: m_ready=true ставится только В applyResult (после генерации
+    // QImage'ов). Если поставить его раньше — UI делает первый fetch ДО того,
+    // как изображения заполнены, получает пустой QImage, и провайдер кэширует
+    // его. Повторный readyChanged уже не триггерит refetch, потому что URL
+    // не изменился (updateTicker=0, currentZ тот же).
+
+    const auto t_recon_start = std::chrono::steady_clock::now();
+    ct::Volume reconstructed_volume;
+    try {
+        backendImpl->reconstructVolumeFromSinograms(
+            loadedSino, angles, reconstructed_volume, params, nullptr);
+    } catch (const std::exception& e) {
+        qDebug() << "[CT] EXCEPTION in reconstructVolumeFromSinograms:" << e.what();
+        return results;
+    }
+    const auto t_recon_end = std::chrono::steady_clock::now();
+
+    results.sinogramTimeSec = 0.0;   // Радона не было
+    const double backend_recon_ms = backendImpl->lastReconstructionTimeMs();
+    if (backend_recon_ms > 0.0) {
+        results.reconTimeSec = backend_recon_ms / 1000.0;
+    } else {
+        results.reconTimeSec = std::chrono::duration<double>(t_recon_end - t_recon_start).count();
+    }
+    qDebug() << "[CT] computeAll[Consumer]: FBP done in" << results.reconTimeSec << "s";
+
+    // Генерация QImage только для реконструкции.
+    #pragma omp parallel for
+    for (int z = 0; z < nz; ++z) {
+        const size_t zi = static_cast<size_t>(z);
+        const ct::Slice reconstruction = reconstructed_volume.getSlice(zi);
+        (*results.reconstructionImages)[zi] = sliceToImage(reconstruction, false);
+    }
+
+    results.maxDifference = 0.0f;   // Consumer не вычисляет diff
+    results.ready   = true;          // ← без этого applyResult оставит m_ready=false,
+                                     //   UI source станет "", slider/Export disabled.
+    results.success = true;
+    return results;
+
+#else
+    // ============================================================
+    // Producer-вариант: оригинальный путь (load NPY → Radon → FBP → metrics).
+    // ============================================================
     int volSize;
     {
         QMutexLocker lock(&m_mutex);
@@ -1169,6 +1282,7 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     results.ready   = true;
     results.success = true;
     return results;
+#endif // !CT_CONSUMER_BUILD
 }
 
 void CtReconstructionController::applyResult(const ReconstructionResult& result) {
@@ -1200,3 +1314,263 @@ void CtReconstructionController::applyResult(const ReconstructionResult& result)
     emit timingsChanged();
     emit maxDifferenceChanged();
 }
+
+#ifdef CT_PRODUCER_BUILD
+// ============================================================
+//  exportAllSinograms — Producer-only
+// ============================================================
+// Открывает file dialog, перепрогоняет computeSinogram по всем слайсам
+// текущего тома (загруженного с диска) и пишет NPY shape (nz, na, bins) +
+// sidecar JSON с метаданными.
+//
+// Пересчёт через computeSinogram — выбран пользователем (см. план). Минимум
+// изменений в backend'ах, использует существующий путь Радона. На быстром
+// Hybrid'е для 1024³ это ~10-15с в worker-thread'е.
+void CtReconstructionController::exportAllSinograms() {
+    if (!m_ready && !m_hasVolume) {
+        qDebug() << "[CT] exportAllSinograms: no volume / no reconstruction yet";
+        return;
+    }
+
+    const QString defaultName = QCoreApplication::applicationDirPath()
+                                + "/data/output/sinograms_"
+                                + QString::number(m_volumeSize) + ".npy";
+    const QString npyPath = QFileDialog::getSaveFileName(
+        nullptr, "Export Sinograms (NPY + sidecar .meta.json)",
+        defaultName, "NumPy (*.npy);;All files (*)");
+    if (npyPath.isEmpty()) return;
+
+    // Запускаем в worker-thread'е через QtConcurrent — UI не подвисает.
+    setRunning(true);
+    auto* watcher = new QFutureWatcher<bool>(this);
+    connect(watcher, &QFutureWatcher<bool>::finished, this, [this, watcher, npyPath]() {
+        const bool ok = watcher->result();
+        watcher->deleteLater();
+        setRunning(false);
+        qDebug() << "[CT] exportAllSinograms:" << (ok ? "OK" : "FAILED") << "→" << npyPath;
+    });
+
+    QFuture<bool> fut = QtConcurrent::run([this, npyPath]() -> bool {
+        int backendId, filterId, volSize;
+        {
+            QMutexLocker lock(&m_mutex);
+            backendId = m_backendType;
+            filterId  = m_filterType;
+            volSize   = m_volumeSize;
+        }
+
+        // Загружаем исходный том с диска (тот же, что использует Generate/Recon).
+        const QString inputNpy = QCoreApplication::applicationDirPath()
+                                 + "/data/output/synthetic_brain_hu_cxx_"
+                                 + QString::number(volSize) + ".npy";
+        ct::Volume volume;
+        if (!ct::FileIO::loadVolumeNPY(inputNpy.toStdString(), volume, false)) {
+            qDebug() << "[CT] exportAllSinograms: failed to load source volume" << inputNpy;
+            return false;
+        }
+
+        const size_t nz = volume.depth;
+        const size_t bins = volume.width;
+
+        ct::ReconstructionParams params = defaultReconstructionParams();
+        if      (filterId == 0) params.filter = ct::ReconstructionParams::FilterType::Ramp;
+        else if (filterId == 1) params.filter = ct::ReconstructionParams::FilterType::SheppLogan;
+        else if (filterId == 2) params.filter = ct::ReconstructionParams::FilterType::Hamming;
+        else if (filterId == 3) params.filter = ct::ReconstructionParams::FilterType::Cosine;
+        else if (filterId == 4) params.filter = ct::ReconstructionParams::FilterType::Hann;
+        else if (filterId == 5) params.filter = ct::ReconstructionParams::FilterType::Bartlett;
+        const size_t na = params.num_angles;
+
+        auto backend = ct::BackendFactory::create(
+            static_cast<ct::BackendFactory::BackendType>(backendId));
+        if (!backend || !backend->isAvailable()) {
+            backend = ct::BackendFactory::createBestAvailable();
+        }
+        qDebug() << "[CT] exportAllSinograms: using backend"
+                 << QString::fromStdString(backend->name())
+                 << "nz=" << nz << "na=" << na << "bins=" << bins;
+
+        // Аллоцируем sinogram-том shape (nz, na, bins).
+        // Для 1024×180×1024 float32 = 754 МБ. На consumer-RAM это ОК
+        // (на хосте, не на GPU).
+        ct::Volume sinoVol;
+        sinoVol.assign(bins, na, nz, 0.0f);   // width=bins, height=na, depth=nz
+
+        // Глобальные min/max HU по всему тому — для записи в meta.
+        float globalMin =  std::numeric_limits<float>::max();
+        float globalMax = -std::numeric_limits<float>::max();
+
+        const auto t0 = std::chrono::steady_clock::now();
+        for (size_t z = 0; z < nz; ++z) {
+            ct::Sinogram sino = backend->computeSinogram(volume.getSlice(z), na, bins);
+            // Копируем data (size = na*bins float) в нужный слой sinoVol.
+            float* dst = &sinoVol.data[(size_t)z * na * bins];
+            std::memcpy(dst, sino.data.data.data(), na * bins * sizeof(float));
+            if (sino.original_min_hu < globalMin) globalMin = sino.original_min_hu;
+            if (sino.original_max_hu > globalMax) globalMax = sino.original_max_hu;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        qDebug() << "[CT] exportAllSinograms: forward Radon for" << nz
+                 << "slices in" << secs << "s";
+
+        // ensureDirectory нерекурсивен — создаём оба уровня.
+        const QString appDir = QCoreApplication::applicationDirPath();
+        ct::utils::ensureDirectory(toWStringBackslashPath(appDir + "/data"));
+        ct::utils::ensureDirectory(toWStringBackslashPath(appDir + "/data/output"));
+
+        // 1. NPY (тот же layout, что у обычного volume — depth=nz, height=na, width=bins).
+        if (!ct::FileIO::saveVolumeNPY(sinoVol, npyPath.toStdString())) {
+            qDebug() << "[CT] exportAllSinograms: failed to write NPY" << npyPath;
+            return false;
+        }
+
+        // 2. Sidecar JSON с метаданными.
+        QJsonObject meta;
+        meta["version"] = 1;
+        meta["depth"]   = (int)nz;
+        meta["num_angles"]   = (int)na;
+        meta["detector_bins"] = (int)bins;
+        meta["detector_spacing_mm"] = 1.0;
+        meta["original_min_hu"] = globalMin;
+        meta["original_max_hu"] = globalMax;
+        QJsonArray angles;
+        const float step = 180.0f / (float)na;
+        for (size_t a = 0; a < na; ++a) angles.append(step * (double)a);
+        meta["angles_deg"] = angles;
+
+        QString jsonPath = npyPath;
+        if (jsonPath.endsWith(".npy", Qt::CaseInsensitive)) {
+            jsonPath.chop(4);
+        }
+        jsonPath += ".meta.json";
+        QFile jf(jsonPath);
+        if (!jf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            qDebug() << "[CT] exportAllSinograms: failed to write JSON sidecar" << jsonPath;
+            return false;
+        }
+        jf.write(QJsonDocument(meta).toJson(QJsonDocument::Indented));
+        jf.close();
+        qDebug() << "[CT] exportAllSinograms: wrote NPY + meta.json";
+        return true;
+    });
+    watcher->setFuture(fut);
+}
+#endif // CT_PRODUCER_BUILD
+
+#ifdef CT_CONSUMER_BUILD
+// ============================================================
+//  loadSinograms — Consumer-only
+// ============================================================
+bool CtReconstructionController::hasSinograms() const {
+    QMutexLocker lock(&m_mutex);
+    return !m_loadedSinograms.empty();
+}
+
+bool CtReconstructionController::loadSinograms() {
+    const QString defaultDir = QCoreApplication::applicationDirPath() + "/data/output";
+    const QString path = QFileDialog::getOpenFileName(
+        nullptr, "Load Sinograms (NPY)", defaultDir,
+        "NumPy sinograms (*.npy);;All files (*)");
+    if (path.isEmpty()) return false;
+
+    ct::Volume vol;
+    if (!ct::FileIO::loadVolumeNPY(path.toStdString(), vol, /*input_is_xyz_layout=*/false)) {
+        qDebug() << "[CT] loadSinograms: failed to parse" << path;
+        return false;
+    }
+    const size_t nz   = vol.depth;
+    const size_t na   = vol.height;
+    const size_t bins = vol.width;
+    if (nz == 0 || na == 0 || bins == 0) {
+        qDebug() << "[CT] loadSinograms: empty volume in" << path;
+        return false;
+    }
+    qDebug() << "[CT] loadSinograms: NPY shape" << nz << "×" << na << "×" << bins;
+
+    // -------- Попытка загрузить sidecar JSON --------
+    std::vector<float> angles;
+    float spacing = 1.0f;
+    float minHu = std::numeric_limits<float>::max();
+    float maxHu = -std::numeric_limits<float>::max();
+    bool gotMetaMinMax = false;
+
+    QString jsonPath = path;
+    if (jsonPath.endsWith(".npy", Qt::CaseInsensitive)) jsonPath.chop(4);
+    jsonPath += ".meta.json";
+
+    QFile jf(jsonPath);
+    if (jf.open(QIODevice::ReadOnly)) {
+        const QByteArray bytes = jf.readAll();
+        QJsonParseError err;
+        const QJsonDocument doc = QJsonDocument::fromJson(bytes, &err);
+        if (err.error == QJsonParseError::NoError && doc.isObject()) {
+            const QJsonObject obj = doc.object();
+            if (obj.contains("detector_spacing_mm")) {
+                spacing = (float)obj["detector_spacing_mm"].toDouble(1.0);
+            }
+            if (obj.contains("original_min_hu") && obj.contains("original_max_hu")) {
+                minHu = (float)obj["original_min_hu"].toDouble(0.0);
+                maxHu = (float)obj["original_max_hu"].toDouble(0.0);
+                gotMetaMinMax = true;
+            }
+            if (obj.contains("angles_deg") && obj["angles_deg"].isArray()) {
+                const QJsonArray arr = obj["angles_deg"].toArray();
+                angles.reserve(arr.size());
+                for (const auto& v : arr) angles.push_back((float)v.toDouble(0.0));
+            }
+            qDebug() << "[CT] loadSinograms: meta.json loaded (spacing=" << spacing
+                     << "min_hu=" << (gotMetaMinMax ? minHu : 0.0f)
+                     << "max_hu=" << (gotMetaMinMax ? maxHu : 0.0f)
+                     << "angles count=" << (int)angles.size() << ")";
+        } else {
+            qDebug() << "[CT] loadSinograms: meta.json parse error:" << err.errorString();
+        }
+    } else {
+        qDebug() << "[CT] loadSinograms: no meta.json sidecar (defaults will be used)";
+    }
+
+    // Если углов нет / неверный размер — равномерно [0, 180).
+    if (angles.size() != na) {
+        if (!angles.empty()) {
+            qDebug() << "[CT] loadSinograms: meta angles count" << (int)angles.size()
+                     << "!= na" << (int)na << "; falling back to uniform";
+        }
+        angles.assign(na, 0.0f);
+        const float step = 180.0f / (float)na;
+        for (size_t a = 0; a < na; ++a) angles[a] = step * (float)a;
+    }
+
+    // Если min/max не пришли — посчитаем из данных (медленно, но точно).
+    if (!gotMetaMinMax) {
+        for (float v : vol.data) {
+            if (v < minHu) minHu = v;
+            if (v > maxHu) maxHu = v;
+        }
+    }
+
+    {
+        QMutexLocker lock(&m_mutex);
+        m_loadedSinograms = std::move(vol);
+        m_loadedAngles    = std::move(angles);
+        m_loadedSpacingMm = spacing;
+        m_loadedMinHu     = minHu;
+        m_loadedMaxHu     = maxHu;
+        m_volumeSize      = (int)bins;   // output size реконструкции = bins
+        // Старая реконструкция (если была) больше не валидна.
+        m_ready = false;
+        if (m_originalImagesPtr) m_originalImagesPtr->clear();
+        if (m_sinogramImagesPtr) m_sinogramImagesPtr->clear();
+        if (m_reconstructionImagesPtr) m_reconstructionImagesPtr->clear();
+        if (m_differenceImagesPtr) m_differenceImagesPtr->clear();
+        // m_hasVolume в Consumer не используется — гейтит hasSinograms.
+    }
+
+    emit hasSinogramsChanged();
+    emit volumeSizeChanged();
+    emit readyChanged();
+    qDebug() << "[CT] loadSinograms: ready (nz=" << (int)nz << ", na=" << (int)na
+             << ", bins=" << (int)bins << ")";
+    return true;
+}
+#endif // CT_CONSUMER_BUILD

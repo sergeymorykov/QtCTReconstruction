@@ -3,6 +3,10 @@
 // Без неё первый же QFileDialog::getOpenFileName/getExistingDirectory падает с
 // фатальной ошибкой "Cannot create a QWidget without QApplication".
 #include <QApplication>
+#include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <QIcon>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 
@@ -30,6 +34,52 @@ int main(int argc, char *argv[])
     qputenv("QT3D_RENDERER", "opengl");
 
     QApplication app(argc, argv);
+
+    // Producer build entry point. CT_PRODUCER_BUILD выставлен из CMake;
+    // controller использует его для условной компиляции Producer-only методов
+    // (exportAllSinograms и т.п.). Consumer-вариант — main_consumer.cpp.
+
+    // Иконка приложения для title bar и taskbar (рантайм-уровень). Иконка .exe
+    // (для Explorer / pre-launch taskbar) подключена через app_icon.rc в CMake.
+    {
+        // 1. Сначала перечислим, что есть в Qt-ресурсе по prefix /icons.
+        qDebug() << "[CT] === icon diagnostics ===";
+        const QStringList iconsInResource = QDir(":/icons").entryList();
+        qDebug() << "[CT] Qt resources at :/icons :" << iconsInResource;
+
+        // 2. Перебираем кандидатов; первый успешный — победил.
+        const QString exeDir = QCoreApplication::applicationDirPath();
+        qDebug() << "[CT] applicationDirPath:" << exeDir;
+        bool loaded = false;
+        for (const QString& candidate : {
+            QStringLiteral(":/icons/icon.png"),     // Qt resource (приоритет)
+            exeDir + "/icon.png",
+            exeDir + "/resources/icon.png",
+            exeDir + "/../../../resources/icon.png" }) {
+            const bool exists = QFile::exists(candidate);
+            qDebug() << "[CT] icon search:" << candidate << "exists=" << exists;
+            if (exists) {
+                QIcon ic(candidate);
+                if (!ic.isNull()) {
+                    app.setWindowIcon(ic);
+                    qDebug() << "[CT] icon LOADED from:" << candidate
+                             << "sizes:" << ic.availableSizes();
+                    loaded = true;
+                    break;
+                } else {
+                    qDebug() << "[CT] icon file exists but QIcon could not decode it (corrupt PNG?)";
+                }
+            }
+        }
+        if (!loaded) {
+            qDebug() << "[CT] icon NOT loaded — fallback Qt default.";
+            qDebug() << "[CT] Checklist:";
+            qDebug() << "  1) Run 'python resources/generate_icon.py' (must produce resources/icon.png)";
+            qDebug() << "  2) Re-run cmake configure (must print '[CT] App icon (.png embedded)')";
+            qDebug() << "  3) Rebuild (must include this exe re-link, not just incremental)";
+        }
+        qDebug() << "[CT] === end icon diagnostics ===";
+    }
 
     // Create the reconstruction controller
     CtReconstructionController controller;

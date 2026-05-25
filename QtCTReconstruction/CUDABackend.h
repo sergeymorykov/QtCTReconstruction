@@ -18,10 +18,22 @@ public:
     Sinogram computeSinogram(const Buffer2D& slice, size_t num_angles, size_t detector_bins, bool use_parallel = true) override;
     Buffer2D reconstructSlice(const Sinogram& sinogram, size_t output_size, const ReconstructionParams& params) override;
 
-    void reconstructVolume(const Volume& input_volume, 
+    void reconstructVolume(const Volume& input_volume,
                            Volume& out_reconstruction,
                            const ReconstructionParams& params,
                            std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) override;
+
+    // Consumer-путь: пропускаем Radon, делаем FBP per-slice через
+    // reconstructSlice. CUDA-аналог Hybrid'овской "from sinograms" версии.
+    // Per-slice цикл благодаря reconstructSlice уже использует cached cuFFT plans
+    // + texture, так что overhead на launch мал. Для большего ускорения можно
+    // переписать с batched cuFFT, но это TODO.
+    void reconstructVolumeFromSinograms(
+        const Volume& sinograms,
+        const std::vector<float>& angles_deg,
+        Volume& out_reconstruction,
+        const ReconstructionParams& params,
+        std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) override;
 
     PointCloud extractPointCloud(const Volume& vol, float threshold) override;
     double lastSinogramTimeMs()       const override { return m_lastSinogramTimeMs; }

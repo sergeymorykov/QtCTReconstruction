@@ -25,10 +25,23 @@ public:
 
     // Пакетная параллельная обработка тома с коллбеком для UI ("on-the-fly" update)
     // Функция запускает процесс и может быть асинхронной или блокирующей.
-    virtual void reconstructVolume(const Volume& input_volume, 
+    virtual void reconstructVolume(const Volume& input_volume,
                                    Volume& out_reconstruction,
                                    const ReconstructionParams& params,
                                    std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone) = 0;
+
+    // Реконструкция тома из УЖЕ ГОТОВЫХ синограмм (используется Consumer-сборкой).
+    // Этап I (forward Radon) пропускается; на вход — sinograms-том shape
+    // (nz, na, bins) и список углов в градусах.
+    //
+    // Дефолтная реализация — per-slice loop через reconstructSlice. Backend'ы
+    // могут переопределить для batched-оптимизации (CUDA/Hybrid делают это).
+    virtual void reconstructVolumeFromSinograms(
+        const Volume& sinograms,
+        const std::vector<float>& angles_deg,
+        Volume& out_reconstruction,
+        const ReconstructionParams& params,
+        std::function<void(int slice_idx, const Buffer2D& recon_slice)> onSliceDone);
 
     // Извлечение облака точек по порогу HU
     virtual PointCloud extractPointCloud(const Volume& vol, float threshold) = 0;

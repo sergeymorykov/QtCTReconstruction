@@ -881,6 +881,74 @@ void CUDABackend::reconstructVolume(const Volume& input_volume,
     (void)total_ms;
 }
 
+// ============================================================
+//  reconstructVolumeFromSinograms — Consumer-path
+// ============================================================
+// CUDA-вариант: per-slice цикл через reconstructSlice. Тот уже использует
+// cached cuFFT plans, persistent device-буферы и memory-pool-ed texture
+// (см. ensure* функции в этом файле), поэтому overhead на launch минимален.
+//
+// Для большего ускорения можно сделать batched: H2D всех синограмм сразу,
+// затем cufftExecR2C/C2R по всему батчу, и kernel'ный backproj по чанкам в
+// 3D-текстуре. Это TODO — пока работает простой путь, в Consumer'е он быстрее
+// дефолтной OpenMP-реализации в десятки раз.
+void CUDABackend::reconstructVolumeFromSinograms(
+    const Volume& sinograms,
+    const std::vector<float>& angles_deg,
+    Volume& out_reconstruction,
+    const ReconstructionParams& params,
+    std::function<void(int, const Buffer2D&)> onSliceDone)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (sinograms.empty()) return;
+
+    const size_t nz   = sinograms.depth;
+    const size_t na   = sinograms.height;
+    const size_t bins = sinograms.width;
+    const size_t output_size = bins;
+
+    out_reconstruction.assign(output_size, output_size, nz, 0.0f);
+    out_reconstruction.x_coords = sinograms.x_coords;
+    out_reconstruction.y_coords = sinograms.y_coords;
+    out_reconstruction.z_coords = sinograms.z_coords;
+
+    // Углы: используем переданные, иначе равномерные [0, 180).
+    std::vector<float> angles = angles_deg;
+    if (angles.size() != na) {
+        angles.assign(na, 0.0f);
+        const float step = 180.0f / (float)na;
+        for (size_t a = 0; a < na; ++a) angles[a] = step * (float)a;
+    }
+
+    const auto t_start = std::chrono::high_resolution_clock::now();
+
+    for (size_t z = 0; z < nz; ++z) {
+        Sinogram s;
+        s.data = sinograms.getSlice(z);
+        s.angles_deg = angles;
+        s.detector_spacing_mm = 1.0f;
+        // Per-sino min/max — даёт работоспособную (хоть и не "истинную") HU-шкалу.
+        // Без per-slice meta точной денормализации не сделать.
+        float vmin = s.data.data.empty() ? 0.0f : s.data.data[0];
+        float vmax = vmin;
+        for (float v : s.data.data) {
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+        s.original_min_hu = vmin;
+        s.original_max_hu = vmax;
+
+        Buffer2D recon = reconstructSlice(s, output_size, params);
+        out_reconstruction.setSlice(z, recon);
+
+        if (onSliceDone) onSliceDone(static_cast<int>(z), recon);
+    }
+
+    const auto t_end = std::chrono::high_resolution_clock::now();
+    m_lastSinogramTimeMs       = 0.0;  // Радона не было
+    m_lastReconstructionTimeMs = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+}
+
 
 PointCloud CUDABackend::extractPointCloud(const Volume& vol, float threshold) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);

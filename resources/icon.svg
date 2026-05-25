@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CT Reconstruction Viewer — application icon.
+  Концепция: тёмный круг (CT axial-срез) + радиальные лучи (X-ray gantry).
+  Стиль: монохром с акцентным цветом, читабельно от 16x16 до 256x256.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Тёмный фон -->
+  <rect width="256" height="256" rx="40" ry="40" fill="#1e1e2e"/>
+
+  <!-- Радиальные лучи X-ray (12 штук, исходят из центра) -->
+  <g stroke="#ffb74d" stroke-width="2" opacity="0.55" stroke-linecap="round">
+    <line x1="128" y1="128" x2="128" y2="14"/>
+    <line x1="128" y1="128" x2="227" y2="71"/>
+    <line x1="128" y1="128" x2="242" y2="128"/>
+    <line x1="128" y1="128" x2="227" y2="185"/>
+    <line x1="128" y1="128" x2="128" y2="242"/>
+    <line x1="128" y1="128" x2="29"  y2="185"/>
+    <line x1="128" y1="128" x2="14"  y2="128"/>
+    <line x1="128" y1="128" x2="29"  y2="71"/>
+  </g>
+
+  <!-- Тонкое кольцо gantry -->
+  <circle cx="128" cy="128" r="106" fill="none" stroke="#ffb74d" stroke-width="3" opacity="0.7"/>
+
+  <!-- Срез: внешнее кольцо (череп) -->
+  <circle cx="128" cy="128" r="82" fill="#2a2a3e" stroke="#e0e0e0" stroke-width="4"/>
+
+  <!-- Внутренняя структура: имитация серого вещества -->
+  <g fill="#a8b3c7" opacity="0.85">
+    <ellipse cx="128" cy="128" rx="62" ry="58"/>
+  </g>
+
+  <!-- Жёлудочки (тёмные внутри) -->
+  <g fill="#1e1e2e">
+    <ellipse cx="110" cy="118" rx="9"  ry="20" transform="rotate(-15 110 118)"/>
+    <ellipse cx="146" cy="118" rx="9"  ry="20" transform="rotate(15 146 118)"/>
+    <ellipse cx="128" cy="148" rx="6"  ry="10"/>
+  </g>
+
+  <!-- Центральная "штамп"-точка (нулевая координата) -->
+  <circle cx="128" cy="128" r="3" fill="#ffb74d"/>
+</svg>

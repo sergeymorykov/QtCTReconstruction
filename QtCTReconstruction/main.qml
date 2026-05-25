@@ -174,6 +174,16 @@ Window {
             }
 
             Button {
+                text: "Export Sinograms"
+                // Активна когда есть исходный том (хоть Generate, хоть Load Volume).
+                // Реконструкция не обязательна — exportAllSinograms сама прогоняет
+                // computeSinogram по слайсам тома.
+                enabled: controller.hasVolume && !controller.running
+                onClicked: controller.exportAllSinograms()
+                implicitHeight: 30
+            }
+
+            Button {
                 text: "3D Cloud Viewer"
                 visible: controller.isDebugBuild
                 enabled: controller.hasVolume
