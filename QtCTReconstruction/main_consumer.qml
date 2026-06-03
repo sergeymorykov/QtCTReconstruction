@@ -47,7 +47,7 @@ Window {
             Layout.preferredHeight: 50
 
             Label {
-                text: "CT Reconstruction Viewer — Consumer"
+                text: "CT Reconstruction Viewer"
                 font.pixelSize: 24
                 font.bold: true
                 color: "white"

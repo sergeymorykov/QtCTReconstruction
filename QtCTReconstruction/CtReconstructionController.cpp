@@ -8,8 +8,10 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QDir>
 #include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFuture>
 #include <QGuiApplication>
 #include <QImage>
@@ -18,6 +20,7 @@
 #include <QJsonObject>
 #include <QMutexLocker>
 #include <QRegularExpression>
+#include <QSettings>
 #include <QStringList>
 #include <QTextStream>
 #include <QtConcurrent/QtConcurrentRun>
@@ -1468,11 +1471,28 @@ bool CtReconstructionController::hasSinograms() const {
 }
 
 bool CtReconstructionController::loadSinograms() {
-    const QString defaultDir = QCoreApplication::applicationDirPath() + "/data/output";
+    // Стартовая директория для QFileDialog. Порядок поиска:
+    //   1. Последняя выбранная пользователем папка (QSettings, переживает перенос .exe)
+    //   2. <exe>/data/output (типовой layout dev-сборки)
+    //   3. Домашняя папка пользователя (гарантированно существует)
+    QSettings settings(QStringLiteral("QtCTReconstruction"),
+                       QStringLiteral("Consumer"));
+    QString defaultDir = settings.value(QStringLiteral("lastSinogramDir")).toString();
+    if (defaultDir.isEmpty() || !QDir(defaultDir).exists()) {
+        const QString devDir = QCoreApplication::applicationDirPath() + "/data/output";
+        defaultDir = QDir(devDir).exists()
+                     ? devDir
+                     : QDir::homePath();
+    }
+
     const QString path = QFileDialog::getOpenFileName(
         nullptr, "Load Sinograms (NPY)", defaultDir,
         "NumPy sinograms (*.npy);;All files (*)");
     if (path.isEmpty()) return false;
+
+    // Запоминаем выбранную папку для следующего запуска.
+    settings.setValue(QStringLiteral("lastSinogramDir"),
+                      QFileInfo(path).absolutePath());
 
     ct::Volume vol;
     if (!ct::FileIO::loadVolumeNPY(path.toStdString(), vol, /*input_is_xyz_layout=*/false)) {

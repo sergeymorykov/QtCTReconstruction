@@ -158,6 +158,17 @@ qt_add_executable(QtCTReconstructionConsumer MANUAL_FINALIZATION
 )
 target_compile_definitions(QtCTReconstructionConsumer PRIVATE CT_CONSUMER_BUILD)
 
+# Консольное окно:
+#   * Debug         → CONSOLE subsystem (qDebug() пишет в stdout, удобно для разработки)
+#   * Release / RWDI / MinSizeRel → WINDOWS subsystem (консоль НЕ открывается при
+#     запуске из Explorer; qDebug по-прежнему виден через OutputDebugString
+#     в DebugView / VS Output).
+# WIN32_EXECUTABLE поддерживает генератор-выражения (CMake ≥ 3.0); используем
+# $<NOT:$<CONFIG:Debug>> чтобы получить per-config поведение.
+set_target_properties(QtCTReconstruction QtCTReconstructionConsumer PROPERTIES
+    WIN32_EXECUTABLE $<NOT:$<CONFIG:Debug>>
+)
+
 # ============================================================
 # Иконка в Qt-resource (для setWindowIcon в рантайме).
 # QIcon(":/icons/icon.png") работает гарантированно если PNG был на месте
@@ -336,14 +347,18 @@ if(WIN32)
     )
 
     foreach(_tgt IN ITEMS QtCTReconstruction QtCTReconstructionConsumer)
+        # Per-config выбор варианта Qt: для Release/RWDI/MinSizeRel — release-DLL
+        # (Qt6Core.dll), для Debug — debug-DLL (Qt6Cored.dll). Это критично для
+        # переносимости Release-сборки: debug Qt тянет vcruntime140d.dll,
+        # которого нет на машинах без Visual Studio.
         add_custom_command(TARGET ${_tgt} POST_BUILD
             COMMAND ${WINDEPLOYQT}
-                --debug
+                $<IF:$<CONFIG:Debug>,--debug,--release>
                 --qmldir "${CMAKE_CURRENT_SOURCE_DIR}/QtCTReconstruction"
                 --no-translations
                 --no-system-d3d-compiler
                 "$<TARGET_FILE_DIR:${_tgt}>/$<TARGET_FILE_NAME:${_tgt}>"
-            COMMENT "📦 Deploying Qt dependencies for ${_tgt}..."
+            COMMENT "📦 Deploying Qt dependencies for ${_tgt} ($<CONFIG>)..."
             VERBATIM
         )
 

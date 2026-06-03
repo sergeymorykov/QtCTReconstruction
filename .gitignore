@@ -361,9 +361,98 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# ============================================================
+# Project-specific (QtCTReconstruction)
+# ============================================================
+
+# --- Внутренние рабочие папки разработчика ---
 _diary_work/
+_thesis_unpacked/
 .claude/
-# Source
+
+# --- Старые/экспериментальные источники, не относящиеся к сборке ---
 book/
 example/
 CPU_EXAMPLE.md
+
+# ============================================================
+# CMake (то, чего нет в стандартном VisualStudio.gitignore)
+# ============================================================
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeScripts/
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+Makefile
+_deps/
+
+# ============================================================
+# Qt (генерируемые qt_add_executable / qt_add_qml_module)
+# ============================================================
+*_autogen/
+.qt/
+.rcc/
+qrc_*.cpp
+moc_*.cpp
+moc_*.h
+ui_*.h
+qmlcache_loader.cpp
+*_qmltyperegistrations.cpp
+*_qmltyperegistrations.json
+.qmlls.ini
+
+# ============================================================
+# CUDA / NVCC промежуточные артефакты
+# ============================================================
+*.cubin
+*.fatbin
+*.ptx
+*.cudafe1.*
+*.cudafe2.*
+*.module_id
+*.gpu
+
+# ============================================================
+# Редакторы / IDE кроме Visual Studio
+# ============================================================
+.vscode/
+.idea/
+.cache/
+.clangd/
+.ccls-cache/
+*.code-workspace
+
+# ============================================================
+# Установщик (dist/)
+# ------------------------------------------------------------
+# Трекаем ТОЛЬКО installer.iss, build_staging.ps1 и LICENSE.txt
+# внутри dist/. Всё остальное — генерируется или скачивается.
+# ============================================================
+dist/app/
+dist/output/
+dist/prereq/*.exe
+dist/prereq/*.msi
+# resources/ в dist/ — копия из ../resources, генерируется при необходимости
+dist/resources/
+
+# ============================================================
+# OS-мусор
+# ============================================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+$RECYCLE.BIN/
+
+# ============================================================
+# Локальные временные файлы документации/черновиков
+# ============================================================
+*.docx#
+~$*.docx
+~$*.xlsx
+~$*.pptx
+*.tmp.docx
+
