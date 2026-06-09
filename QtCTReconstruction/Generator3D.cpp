@@ -1,6 +1,8 @@
 #include "Generator3D.h"
 #include "Generator3DCPU.h"
+#ifndef CT_NO_CUDA
 #include "Generator3DGPU.h"
+#endif
 #include "Utils.h"
 #include <iostream>
 
@@ -14,6 +16,7 @@ Generator3D::Generator3D() {
 Generator3D::~Generator3D() = default;
 
 void Generator3D::setBackend(BackendType type) {
+#ifndef CT_NO_CUDA
     if (type == BackendType::CUDA) {
         auto gpu = std::make_unique<Generator3DGPU>();
         if (gpu->isAvailable()) {
@@ -25,6 +28,14 @@ void Generator3D::setBackend(BackendType type) {
     } else {
         m_impl = std::make_unique<Generator3DCPU>();
     }
+#else
+    // Сборка без CUDA: всегда CPU-генератор, независимо от запрошенного типа.
+    if (type == BackendType::CUDA) {
+        std::cerr << "Build without CUDA: GPU generator unavailable, using CPU." << std::endl;
+    }
+    (void)type;
+    m_impl = std::make_unique<Generator3DCPU>();
+#endif
 }
 
 Volume Generator3D::generateBrainHU(const Params& params) {
@@ -35,13 +46,13 @@ Volume Generator3D::generateBrainHU(const Params& params) {
 Volume Generator3D::generate(const Params& params) {
     // Helper static method for one-off generation
     Generator3D gen;
-    // Try GPU first by default if static generate is called? 
-    // Or stick to CPU for safety? The user's request suggests 
-    // they want to be able to switch, but for "generate(params)" let's try GPU if available.
+#ifndef CT_NO_CUDA
+    // Try GPU first if available, otherwise fall back to CPU.
     auto gpu = std::make_unique<Generator3DGPU>();
     if (gpu->isAvailable()) {
         return gpu->generateBrainHU(params);
     }
+#endif
     return Generator3DCPU().generateBrainHU(params);
 }
 

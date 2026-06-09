@@ -39,7 +39,9 @@
 #include <string>
 
 #include <omp.h>
+#ifndef CT_NO_CUDA
 #include <cuda_runtime.h>
+#endif
 
 namespace {
 
@@ -1132,6 +1134,9 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     ct::Volume reconstructed_volume;
 
     // --- ТОЧНОЕ ПРОФИЛИРОВАНИЕ GPU ---
+    // В CPU-only сборке (CT_NO_CUDA) используется только std::chrono;
+    // GPU-таймеры через cudaEvent заменяются wall-clock измерением.
+#ifndef CT_NO_CUDA
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -1147,10 +1152,24 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
         return results;
     }
     cudaEventRecord(stop);
-    
+
     cudaEventSynchronize(stop);
     float gpu_compute_ms = 0;
     cudaEventElapsedTime(&gpu_compute_ms, start, stop);
+#else
+    // CPU-only fallback: измеряем wall-clock через std::chrono.
+    const auto t_compute_start = std::chrono::steady_clock::now();
+    try {
+        backendImpl->reconstructVolume(volume, reconstructed_volume, params, nullptr);
+    } catch (const std::exception& e) {
+        qDebug() << "[CT] EXCEPTION in reconstructVolume:" << e.what();
+        results.success = false;
+        return results;
+    }
+    const auto t_compute_end = std::chrono::steady_clock::now();
+    const float gpu_compute_ms = static_cast<float>(
+        std::chrono::duration<double, std::milli>(t_compute_end - t_compute_start).count());
+#endif
 
     const auto t_recon_done = std::chrono::steady_clock::now();
     results.sinogramTimeSec = backendImpl->lastSinogramTimeMs() / 1000.0;
@@ -1167,11 +1186,13 @@ CtReconstructionController::ReconstructionResult CtReconstructionController::rec
     }
 
     qDebug() << "[CT] computeAll: batch recon done.";
-    qDebug() << "[BENCH] GPU Compute Only:" << gpu_compute_ms << "ms";
+    qDebug() << "[BENCH] Compute Only:" << gpu_compute_ms << "ms";
     qDebug() << "[BENCH] Total (with CPU logic):" << (results.reconTimeSec * 1000.0) << "ms";
 
+#ifndef CT_NO_CUDA
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+#endif
 
     qDebug() << "[CT] computeAll: Generating images for UI...";
 

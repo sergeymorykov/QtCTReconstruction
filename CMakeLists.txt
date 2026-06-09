@@ -1,11 +1,51 @@
 cmake_minimum_required(VERSION 3.18)
-project(QtCTReconstruction LANGUAGES CXX CUDA)
+
+# ============================================================
+# CUDA: опциональная зависимость
+# ------------------------------------------------------------
+# CT_ENABLE_CUDA=AUTO (по умолчанию) — CUDA включается, если CUDAToolkit
+#   найден на системе, иначе автоматически выключается.
+# CT_ENABLE_CUDA=ON                 — требовать CUDA, ошибка configure если её нет.
+# CT_ENABLE_CUDA=OFF                — собирать только CPU-бэкенды (без CUDA/Hybrid).
+# ============================================================
+set(CT_ENABLE_CUDA "AUTO" CACHE STRING "Enable CUDA backends: AUTO, ON, OFF")
+set_property(CACHE CT_ENABLE_CUDA PROPERTY STRINGS AUTO ON OFF)
+
+# Сначала проверяем, доступен ли CUDA Toolkit, затем решаем, объявлять ли
+# CUDA как язык проекта. Это позволяет собрать проект на машинах без CUDA.
+set(_ct_cuda_enabled FALSE)
+if(CT_ENABLE_CUDA STREQUAL "OFF")
+    message(STATUS "[CT] CUDA: DISABLED (CT_ENABLE_CUDA=OFF) — CPU-only build")
+else()
+    # Пробуем найти CUDAToolkit БЕЗ REQUIRED (чтобы не падать при отсутствии).
+    # ПРИМЕЧАНИЕ: FindCUDAToolkit становится доступным только после project()
+    # с языком CUDA — поэтому используем альтернативный путь через find_package
+    # с QUIET перед project(). Это работает в CMake ≥ 3.17.
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        set(_ct_cuda_enabled TRUE)
+        message(STATUS "[CT] CUDA: ENABLED (CUDAToolkit found: ${CUDAToolkit_VERSION})")
+    else()
+        if(CT_ENABLE_CUDA STREQUAL "ON")
+            message(FATAL_ERROR
+                "[CT] CT_ENABLE_CUDA=ON requested, but CUDAToolkit was not found. "
+                "Install NVIDIA CUDA Toolkit or set CT_ENABLE_CUDA=OFF.")
+        endif()
+        message(STATUS "[CT] CUDA: DISABLED (CUDAToolkit not found) — CPU-only build")
+    endif()
+endif()
+
+if(_ct_cuda_enabled)
+    project(QtCTReconstruction LANGUAGES CXX CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89)
+else()
+    project(QtCTReconstruction LANGUAGES CXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89)
 
 # Qt 6
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Quick QuickControls2 QuickLayouts 3DCore 3DRender 3DExtras 3DQuick 3DQuickScene3D)
@@ -16,9 +56,6 @@ set(CMAKE_AUTORCC ON)
 
 # OpenMP (required for fallback & CPU ops)
 find_package(OpenMP REQUIRED)
-
-# CUDA setup
-find_package(CUDAToolkit REQUIRED)
 
 # ============================================================
 # Producer / Consumer split
@@ -37,15 +74,12 @@ set(CT_COMMON_SOURCES
     QtCTReconstruction/Utils.cpp
     QtCTReconstruction/Generator3D.cpp
     QtCTReconstruction/Generator3DCPU.cpp
-    QtCTReconstruction/Generator3DGPU.cu
     QtCTReconstruction/RadonTransform.cpp
     QtCTReconstruction/FilterDesign.cpp
     QtCTReconstruction/FilteredBackprojection.cpp
     QtCTReconstruction/FFT.cpp
     QtCTReconstruction/BackendFactory.cpp
     QtCTReconstruction/OpenMPBackend.cpp
-    QtCTReconstruction/CUDABackend.cu
-    QtCTReconstruction/HybridBackend.cu
     QtCTReconstruction/PointCloudGeometry.cpp
     QtCTReconstruction/OptimizedBackprojectionCPU.cpp
     QtCTReconstruction/ProjectionGeometry.cpp
@@ -53,6 +87,15 @@ set(CT_COMMON_SOURCES
     QtCTReconstruction/IFFTBackend.cpp
     QtCTReconstruction/FFTBackendBuiltin.cpp
 )
+
+# CUDA-источники добавляются только если CUDA включена.
+if(_ct_cuda_enabled)
+    list(APPEND CT_COMMON_SOURCES
+        QtCTReconstruction/Generator3DGPU.cu
+        QtCTReconstruction/CUDABackend.cu
+        QtCTReconstruction/HybridBackend.cu
+    )
+endif()
 
 # ============================================================
 # FFT бэкенд (переключается через cmake -DFFT_BACKEND=Builtin|FFTW)
@@ -259,11 +302,21 @@ foreach(_tgt IN ITEMS QtCTReconstruction QtCTReconstructionConsumer)
         Qt6::3DQuick
         Qt6::3DQuickScene3D
         OpenMP::OpenMP_CXX
-        CUDA::cudart
-        CUDA::cufft
         gdiplus
         comctl32
     )
+
+    # --- CUDA libs (только когда CUDA включена) ---
+    if(_ct_cuda_enabled)
+        target_link_libraries(${_tgt} PRIVATE
+            CUDA::cudart
+            CUDA::cufft
+        )
+    else()
+        # Сообщаем коду, что CUDA не собирается: BackendFactory / Generator3D /
+        # CtReconstructionController исключают соответствующие пути.
+        target_compile_definitions(${_tgt} PRIVATE CT_NO_CUDA)
+    endif()
 
     # --- MSVC: OpenMP + EH ---
     if(MSVC)
@@ -271,8 +324,12 @@ foreach(_tgt IN ITEMS QtCTReconstruction QtCTReconstructionConsumer)
             $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>
             $<$<COMPILE_LANGUAGE:CXX>:/openmp:experimental>
             $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/openmp:llvm>
         )
+        if(_ct_cuda_enabled)
+            target_compile_options(${_tgt} PRIVATE
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/openmp:llvm>
+            )
+        endif()
     endif()
 
     # --- Debug/Release дефайны ---
@@ -282,19 +339,25 @@ foreach(_tgt IN ITEMS QtCTReconstruction QtCTReconstructionConsumer)
     )
 
     # --- CUDA Release flags ---
-    target_compile_options(${_tgt} PRIVATE
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:${_ct_cuda_release_flags}>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:${_ct_cuda_release_flags}>
-    )
+    if(_ct_cuda_enabled)
+        target_compile_options(${_tgt} PRIVATE
+            $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:${_ct_cuda_release_flags}>
+            $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:${_ct_cuda_release_flags}>
+        )
+    endif()
 
     # --- Release с PDB-символами ---
     if(MSVC)
         target_compile_options(${_tgt} PRIVATE
             $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/Zi>
-            $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-Xcompiler=/Zi>
             $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:RelWithDebInfo>>:/Zi>
-            $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:-Xcompiler=/Zi>
         )
+        if(_ct_cuda_enabled)
+            target_compile_options(${_tgt} PRIVATE
+                $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-Xcompiler=/Zi>
+                $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:-Xcompiler=/Zi>
+            )
+        endif()
         target_link_options(${_tgt} PRIVATE
             $<$<CONFIG:Release>:/DEBUG>
             $<$<CONFIG:Release>:/OPT:REF>
@@ -320,21 +383,25 @@ endif()
 # --- Глобальные MSVC флаги (не per-target) ---
 if(MSVC)
     add_compile_options(/utf-8 /Zc:preprocessor)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler /Zc:preprocessor")
+    if(_ct_cuda_enabled)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler /Zc:preprocessor")
+    endif()
 endif()
 
 # ============================================================
 # CUDA Debug режим (фастер дебаг без -G)
 # ============================================================
-option(CT_CUDA_FAST_DEBUG
-       "Strip -G from Debug CUDA flags (kernels run at full speed; host -g kept)"
-       OFF)
+if(_ct_cuda_enabled)
+    option(CT_CUDA_FAST_DEBUG
+           "Strip -G from Debug CUDA flags (kernels run at full speed; host -g kept)"
+           OFF)
 
-if(CT_CUDA_FAST_DEBUG)
-    set(CMAKE_CUDA_FLAGS_DEBUG "-g" CACHE STRING "" FORCE)
-    message(STATUS "[CT] CUDA Debug: FAST mode (no -G, kernels optimised)")
-else()
-    message(STATUS "[CT] CUDA Debug: standard mode (-G -g, kernels NON-optimised)")
+    if(CT_CUDA_FAST_DEBUG)
+        set(CMAKE_CUDA_FLAGS_DEBUG "-g" CACHE STRING "" FORCE)
+        message(STATUS "[CT] CUDA Debug: FAST mode (no -G, kernels optimised)")
+    else()
+        message(STATUS "[CT] CUDA Debug: standard mode (-G -g, kernels NON-optimised)")
+    endif()
 endif()
 
 # ============================================================

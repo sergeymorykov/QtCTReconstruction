@@ -3,8 +3,10 @@
 #include "SerialBackend.h"
 #endif
 #include "OpenMPBackend.h"
+#ifndef CT_NO_CUDA
 #include "CUDABackend.h"
 #include "HybridBackend.h"
+#endif
 
 namespace ct {
 
@@ -65,19 +67,27 @@ std::shared_ptr<IReconstructionBackend> BackendFactory::create(BackendType type)
 #endif
     if (type == BackendType::OpenMP) {
         return std::make_shared<OpenMPBackend>();
-    } else if (type == BackendType::CUDA) {
+    }
+#ifndef CT_NO_CUDA
+    else if (type == BackendType::CUDA) {
         return std::make_shared<CUDABackend>();
     } else if (type == BackendType::Hybrid) {
         return std::make_shared<HybridBackend>();
     }
+#else
+    // Сборка без CUDA: CUDA / Hybrid недоступны.
+    (void)type;
+#endif
     return nullptr;
 }
 
 std::shared_ptr<IReconstructionBackend> BackendFactory::createBestAvailable() {
+#ifndef CT_NO_CUDA
     auto cudaBackend = create(BackendType::CUDA);
     if (cudaBackend && cudaBackend->isAvailable()) {
         return cudaBackend;
     }
+#endif
     return create(BackendType::OpenMP);
 }
 
